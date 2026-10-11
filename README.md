@@ -71,6 +71,36 @@ python check_submission.py --model runs/improved_seed42/model.py \
 EMA는 `--ema_decay 0`으로 별도 실험할 수 있습니다. batch size 변경 시에도 새 run을 사용하세요.
 최종 후보는 seed 42/43/44로 재학습해 성능 변동을 확인하는 것을 권장합니다.
 
+## 0.9800 목표를 위한 다음 실험
+
+첫 전체 학습의 검증 평균 Macro-F1은 **0.9647**(34 epoch EMA), 작물 **0.9507**,
+건강 **0.9787**이었습니다. Apple F1은 **0.9195**이며 Apple 360장 중 36장을 Tomato로 예측했습니다.
+이 수치는 사용자가 Colab에서 실행한 로그이며, 테스트 세트 성능이나 다음 설정의 성능은 아직 확인되지 않았습니다.
+
+먼저 증강 없는 train/valid 평가와 오분류 목록으로 과적합 여부와 작물·건강 조합별 오류를 확인합니다.
+진단은 저장한 run의 모델·데이터 소스를 사용하므로 기존 가중치를 바꾸지 않습니다.
+
+```bash
+python diagnose.py --run_dir runs/improved_seed42
+```
+
+다음은 같은 모델 구조에서 본인이 제공 데이터로 처음부터 학습한 최고 가중치만 이어 사용하는
+20 epoch 추가 학습 후보입니다. 외부 사전학습 가중치는 사용하지 않습니다.
+작물 손실 비중과 작물 클래스 균형 보정을 높이고, 잎 형태·색을 더 보존하는 gentle 증강을 사용합니다.
+
+```bash
+python train.py --run_dir runs/crop_refine_seed42 \
+  --init_weights runs/improved_seed42/best_model.pt \
+  --epochs 20 --lr 0.0002 --warmup_epochs 1 \
+  --augmentation gentle --crop_loss_weight 1.25 \
+  --crop_class_weight_power 0.5 --label_smoothing 0.02
+```
+
+새 run은 시작 가중치도 epoch 0 후보로 평가·보관합니다. 이후 점수가 더 낮으면 그 가중치를 유지하며,
+기존 `runs/improved_seed42`는 덮어쓰지 않습니다. 기본 `python train.py` 설정은 종전과 같습니다.
+학습 코드가 변경되었으므로 과거 run을 현재 코드의 `--resume`으로 재개하지 말고,
+추가 실험에는 `--init_weights`와 새 run 폴더를 사용하세요. 목표 0.9800 도달은 보장하지 않습니다.
+
 ## 검증과 노트북 갱신
 
 ```bash

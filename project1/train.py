@@ -114,6 +114,15 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=3e-4)
     parser.add_argument("--class_weight_power", type=float, default=0.35,
                         help="0 disables class weighting; only train labels determine weights")
+    parser.add_argument("--crop_class_weight_power", type=float, default=None,
+                        help="Override class_weight_power for the crop task only")
+    parser.add_argument("--health_class_weight_power", type=float, default=None,
+                        help="Override class_weight_power for the health task only")
+    parser.add_argument("--crop_loss_weight", type=float, default=1.0)
+    parser.add_argument("--health_loss_weight", type=float, default=1.0)
+    parser.add_argument("--augmentation", choices=("standard", "gentle"), default="standard")
+    parser.add_argument("--init_weights", default=None,
+                        help="Start a NEW run from your own checkpoint trained only on the provided data")
     parser.add_argument("--label_smoothing", type=float, default=0.03)
     parser.add_argument("--ema_decay", type=float, default=0.99, help="0 disables EMA")
     parser.add_argument("--seed", type=int, default=42)
@@ -131,6 +140,11 @@ def parse_args():
         parser.error("Require epochs >= 1, batch_size >= 2 and 0 <= min_lr <= lr with lr > 0")
     if args.warmup_epochs < 0 or args.weight_decay < 0 or args.class_weight_power < 0:
         parser.error("Warmup, decay and class_weight_power cannot be negative")
+    if any(power is not None and power < 0 for power in
+           (args.crop_class_weight_power, args.health_class_weight_power)):
+        parser.error("Task-specific class weight powers cannot be negative")
+    if args.crop_loss_weight <= 0 or args.health_loss_weight <= 0:
+        parser.error("Task loss weights must be positive")
     if not 0 <= args.ema_decay < 1 or not 0 <= args.label_smoothing < 1:
         parser.error("EMA decay and label smoothing must be in [0, 1)")
     if min(args.num_workers, args.train_limit, args.valid_limit) < 0 or args.num_threads < 1:
@@ -168,7 +182,10 @@ def main():
     else:
         for name in hashes:
             shutil.copy2(source_dir / name, run_dir / name)
+        initial_hash = (hashlib.sha256(Path(args.init_weights).read_bytes()).hexdigest()
+                        if args.init_weights else None)
         write_json({"args": vars(args), "source_sha256": hashes,
+                    "init_weights_sha256": initial_hash,
                     "torch": torch.__version__, "device": str(device),
                     "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None},
                    run_dir / "config.json")
@@ -196,7 +213,20 @@ def main():
         write_json(result, run_dir / "evaluation.json")
         return
 
-    train_set = PlantDataset(args.data_dir, "train", get_transforms(True, not args.no_augment))
+    initial_result = None
+    if args.init_weights and not args.resume:
+        model.load_state_dict(torch.load(args.init_weights, map_location=device, weights_only=True))
+        initial_result = evaluate(model, valid_loader, device)
+        print(f"Own-data starting checkpoint: mean Macro-F1 {initial_result['score']:.4f}", flush=True)
+        atomic_save({key: value.detach().cpu() for key, value in model.state_dict().items()}, best_path)
+        if best_path.stat().st_size > 10 * 1024 * 1024:
+            raise ValueError("Starting checkpoint exceeds 10 MiB")
+        write_json({"epoch": 0, "variant": "initial", "weights_bytes": best_path.stat().st_size,
+                    "smoke_run": bool(args.train_limit or args.valid_limit), **initial_result},
+                   run_dir / "best_metrics.json")
+
+    train_set = PlantDataset(args.data_dir, "train", get_transforms(
+        True, not args.no_augment, profile=args.augmentation))
     rows = train_set.rows
     if args.train_limit:
         indices = torch.randperm(len(train_set), generator=torch.Generator().manual_seed(args.seed))[
@@ -209,10 +239,14 @@ def main():
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=device.type == "cuda",
                               worker_init_fn=seed_worker, generator=generator)
+    powers = [args.class_weight_power if power is None else power for power in
+              (args.crop_class_weight_power, args.health_class_weight_power)]
     criteria = [nn.CrossEntropyLoss(
-        weight=class_weights(rows, key, classes, args.class_weight_power, device),
+        weight=class_weights(rows, key, classes, power, device),
         label_smoothing=args.label_smoothing,
-    ) for key, classes in (("crop_label", 3), ("health_label", 2))]
+    ) for (key, classes), power in zip((("crop_label", 3), ("health_label", 2)), powers)]
+    print(f"Loss weights: crop {args.crop_loss_weight}, health {args.health_loss_weight}; "
+          f"augmentation {args.augmentation}")
     decay, no_decay = [], []
     for parameter in model.parameters():
         (decay if parameter.ndim > 1 else no_decay).append(parameter)
@@ -233,7 +267,7 @@ def main():
     amp = device.type == "cuda" and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay else None
-    history, best_score, first_epoch = [], -1.0, 1
+    history, best_score, first_epoch = [], initial_result["score"] if initial_result else -1.0, 1
     if args.resume:
         saved = torch.load(last_path, map_location="cpu", weights_only=True)
         ignored = {"resume", "eval_only", "run_dir", "device", "num_workers", "num_threads"}
@@ -267,7 +301,8 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp):
                 crop, health = model(images)
-                loss = criteria[0](crop, crops) + criteria[1](health, healths)
+                loss = (args.crop_loss_weight * criteria[0](crop, crops)
+                        + args.health_loss_weight * criteria[1](health, healths))
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite training loss")
             scaler.scale(loss).backward()

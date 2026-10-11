@@ -57,6 +57,10 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 3e-4
 CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
+CROP_CLASS_WEIGHT_POWER = None  # 작물만 조정하려면 예: 0.5
+CROP_LOSS_WEIGHT = 1.0          # 작물 손실 비중을 높이려면 예: 1.25
+AUGMENTATION = 'standard'       # 'gentle'은 잎 형태를 더 보존하는 약한 증강
+INIT_WEIGHTS = None            # 본인이 제공 데이터로 학습한 best_model.pt 경로만 사용
 RUN_BASELINE = True
 BASELINE_EPOCHS = 10
 
@@ -98,7 +102,7 @@ markdown("""
 이미 수정한 파일이 있으면 덮어쓰지 않고 중단합니다. 파일을 편집한 뒤에는 기존 작업 폴더에서 실행하세요.
 """)
 sources = {name: (ROOT / 'project1' / name).read_text(encoding='utf-8')
-           for name in ('model.py', 'dataset.py', 'train.py', 'check_submission.py')}
+           for name in ('model.py', 'dataset.py', 'train.py', 'diagnose.py', 'check_submission.py')}
 code('SOURCES = ' + pprint.pformat(sources, width=100, sort_dicts=False) + '\n\n' + textwrap.dedent("""
 for name, source in SOURCES.items():
     path = WORK / name
@@ -224,7 +228,12 @@ code("""
 command = [sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
            '--run_dir', str(RUN_DIR), '--epochs', str(EPOCHS), '--batch_size', str(BATCH_SIZE),
            '--lr', str(LEARNING_RATE), '--weight_decay', str(WEIGHT_DECAY),
-           '--class_weight_power', str(CLASS_WEIGHT_POWER), '--seed', str(SEED), '--device', 'cuda']
+           '--class_weight_power', str(CLASS_WEIGHT_POWER), '--crop_loss_weight', str(CROP_LOSS_WEIGHT),
+           '--augmentation', AUGMENTATION, '--seed', str(SEED), '--device', 'cuda']
+if CROP_CLASS_WEIGHT_POWER is not None:
+    command.extend(['--crop_class_weight_power', str(CROP_CLASS_WEIGHT_POWER)])
+if INIT_WEIGHTS is not None:
+    command.extend(['--init_weights', str(INIT_WEIGHTS)])
 if (RUN_DIR / 'last_checkpoint.pt').exists():
     command.append('--resume')
 run_logged(command, WORK, RUN_DIR / 'console.log')

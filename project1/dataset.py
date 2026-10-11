@@ -44,18 +44,24 @@ class PlantDataset(Dataset):
         return image, int(row["crop_label"]), int(row["health_label"])
 
 
-def get_transforms(train, augment=True):
+def get_transforms(train, augment=True, profile="standard"):
     normalize = transforms.Normalize([0.5] * 3, [0.5] * 3)
     if train and augment:
+        if profile not in ("standard", "gentle"):
+            raise ValueError(f"Unknown augmentation profile: {profile}")
+        gentle = profile == "gentle"
         return transforms.Compose([
             transforms.RandomResizedCrop(
-                128, scale=(0.8, 1.0), ratio=(0.9, 1.1),
+                128, scale=(0.9, 1.0) if gentle else (0.8, 1.0), ratio=(0.9, 1.1),
                 interpolation=InterpolationMode.BILINEAR,
             ),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(25, interpolation=InterpolationMode.BILINEAR),
-            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.12, hue=0.02),
+            transforms.RandomRotation(15 if gentle else 25, interpolation=InterpolationMode.BILINEAR),
+            transforms.ColorJitter(
+                brightness=0.10 if gentle else 0.15, contrast=0.10 if gentle else 0.15,
+                saturation=0.08 if gentle else 0.12, hue=0.01 if gentle else 0.02,
+            ),
             transforms.ToTensor(),
             normalize,
         ])
