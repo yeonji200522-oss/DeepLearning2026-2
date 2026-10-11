@@ -105,27 +105,27 @@ class ModelEMA:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_dir", default="student_data_128")
-    parser.add_argument("--run_dir", default="runs/improved_seed42")
-    parser.add_argument("--model", choices=("standard", "deep"), default="standard",
-                        help="deep adds residual blocks and larger heads; exported model.py matches weights")
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--run_dir", default="runs/deep_seed42")
+    parser.add_argument("--model", choices=("deep",), default="deep",
+                        help="model.py contains the deep CNN; no separate model file is required")
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--min_lr", type=float, default=1e-5)
-    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--weight_decay", type=float, default=3e-4)
     parser.add_argument("--class_weight_power", type=float, default=0.35,
                         help="0 disables class weighting; only train labels determine weights")
-    parser.add_argument("--crop_class_weight_power", type=float, default=None,
+    parser.add_argument("--crop_class_weight_power", type=float, default=0.5,
                         help="Override class_weight_power for the crop task only")
     parser.add_argument("--health_class_weight_power", type=float, default=None,
                         help="Override class_weight_power for the health task only")
-    parser.add_argument("--crop_loss_weight", type=float, default=1.0)
+    parser.add_argument("--crop_loss_weight", type=float, default=1.25)
     parser.add_argument("--health_loss_weight", type=float, default=1.0)
-    parser.add_argument("--augmentation", choices=("standard", "gentle"), default="standard")
+    parser.add_argument("--augmentation", choices=("standard", "gentle"), default="gentle")
     parser.add_argument("--init_weights", default=None,
                         help="Start a NEW run from your own checkpoint trained only on the provided data")
-    parser.add_argument("--label_smoothing", type=float, default=0.03)
+    parser.add_argument("--label_smoothing", type=float, default=0.02)
     parser.add_argument("--ema_decay", type=float, default=0.99, help="0 disables EMA")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -169,7 +169,7 @@ def main():
         raise RuntimeError("CUDA unavailable; enable a Colab GPU or select --device cpu")
     run_dir = Path(args.run_dir).resolve()
     source_dir = Path(__file__).resolve().parent
-    model_source = source_dir / ("model_deep.py" if args.model == "deep" else "model.py")
+    model_source = source_dir / "model.py"
     spec = importlib.util.spec_from_file_location("selected_leaf_model", model_source)
     model_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(model_module)
@@ -189,9 +189,6 @@ def main():
     else:
         for name, path in source_paths.items():
             shutil.copy2(path, run_dir / name)
-        if args.model == "deep":
-            # Retain this name too so the saved trainer can resume --model deep.
-            shutil.copy2(model_source, run_dir / "model_deep.py")
         initial_hash = (hashlib.sha256(Path(args.init_weights).read_bytes()).hexdigest()
                         if args.init_weights else None)
         write_json({"args": vars(args), "source_sha256": hashes,

@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT / "project1"
 sys.path.insert(0, str(PROJECT))
 from model import MultiTaskCNN
-from model_deep import MultiTaskCNN as DeepCNN
 from dataset import get_transforms, PlantDataset
 from train import macro_f1, evaluate
 
@@ -78,14 +77,14 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertEqual(per_class[2], 0)
 
     def test_deep_model_standalone_submission_contract(self):
-        self.assertEqual(checker.check_imports(str(PROJECT / "model_deep.py")), [])
-        model = DeepCNN().eval()
+        self.assertEqual(checker.check_imports(str(PROJECT / "model.py")), [])
+        model = MultiTaskCNN().eval()
         total = sum(p.numel() for p in model.parameters()) + sum(
             b.numel() for b in model.buffers() if b.is_floating_point())
         self.assertLessEqual(total, checker.MAX_PARAMS)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            (path / "model.py").write_bytes((PROJECT / "model_deep.py").read_bytes())
+            (path / "model.py").write_bytes((PROJECT / "model.py").read_bytes())
             spec = importlib.util.spec_from_file_location("isolated_deep_submission", path / "model.py")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
@@ -104,21 +103,25 @@ class SubmissionContractTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("PLANT_DATA_DIR"), "Set PLANT_DATA_DIR to run real-data tests")
 class TrainingIntegrationTests(unittest.TestCase):
-    def test_deep_training_exports_matching_model_and_resumes_from_retained_sources(self):
+    def test_three_files_train_and_resume_without_extra_model_file(self):
         with tempfile.TemporaryDirectory(prefix="leaf-deep-") as directory:
             run = Path(directory) / "run"
+            work = Path(directory) / "project"
+            work.mkdir()
+            for name in ("model.py", "dataset.py", "train.py"):
+                (work / name).write_bytes((PROJECT / name).read_bytes())
             data = Path(os.environ["PLANT_DATA_DIR"]).resolve()
-            arguments = ["--data_dir", str(data), "--run_dir", str(run), "--model", "deep",
+            arguments = ["--data_dir", str(data), "--run_dir", str(run),
                          "--epochs", "1", "--batch_size", "4", "--train_limit", "8",
                          "--valid_limit", "8", "--num_workers", "0", "--device", "cpu"]
-            result = subprocess.run([sys.executable, "train.py", *arguments], cwd=PROJECT,
+            result = subprocess.run([sys.executable, "train.py", *arguments], cwd=work,
                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertEqual(result.returncode, 0, result.stdout)
-            self.assertEqual((run / "model.py").read_bytes(), (PROJECT / "model_deep.py").read_bytes())
-            self.assertEqual((run / "model_deep.py").read_bytes(), (run / "model.py").read_bytes())
-            restored = DeepCNN()
+            self.assertEqual((run / "model.py").read_bytes(), (PROJECT / "model.py").read_bytes())
+            self.assertFalse((run / "model_deep.py").exists())
+            restored = MultiTaskCNN()
             restored.load_state_dict(torch.load(run / "best_model.pt", weights_only=True))
-            # The saved run must be self-contained, including --model deep startup.
+            # Both training and retained run startup need only the three source files.
             resumed = subprocess.run([sys.executable, "train.py", *arguments, "--resume"], cwd=run,
                                      text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertEqual(resumed.returncode, 0, resumed.stdout)

@@ -52,7 +52,7 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 code("""
 from pathlib import Path
 RUN_NAME = 'deep_seed42'
-MODEL_VARIANT = 'deep'  # 이전 모델은 'standard'
+MODEL_VARIANT = 'deep'  # model.py에 포함된 확장 모델
 SEED = 42
 EPOCHS = 100
 BATCH_SIZE = 64
@@ -110,7 +110,7 @@ markdown("""
 이미 수정한 파일이 있으면 덮어쓰지 않고 중단합니다. 파일을 편집한 뒤에는 기존 작업 폴더에서 실행하세요.
 """)
 sources = {name: (ROOT / 'project1' / name).read_text(encoding='utf-8')
-           for name in ('model.py', 'model_deep.py', 'dataset.py', 'train.py', 'diagnose.py', 'check_submission.py')}
+           for name in ('model.py', 'dataset.py', 'train.py', 'diagnose.py', 'check_submission.py')}
 code('SOURCES = ' + pprint.pformat(sources, width=100, sort_dicts=False) + '\n\n' + textwrap.dedent("""
 for name, source in SOURCES.items():
     path = WORK / name
@@ -137,7 +137,7 @@ def load_module(name, path):
     return module
 
 data_module = load_module('leaf_dataset', WORK / 'dataset.py')
-MODEL_PATH = WORK / ('model_deep.py' if MODEL_VARIANT == 'deep' else 'model.py')
+MODEL_PATH = WORK / 'model.py'
 model_module = load_module('leaf_model', MODEL_PATH)
 checker_module = load_module('leaf_checker', WORK / 'check_submission.py')
 assert not checker_module.check_imports(str(MODEL_PATH))

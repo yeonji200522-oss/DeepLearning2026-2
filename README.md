@@ -24,8 +24,8 @@
 
 - [모델](project1/model.py): Residual CNN, BatchNorm, SE channel attention, 평균/최대 pooling,
   두 분류 헤드의 LayerNorm과 Dropout(0.2).
-- [확장 모델](project1/model_deep.py): Residual 블록 5→7개, 두 분류 헤드 크기 128→256.
-  `train.py --model deep`으로 선택합니다. 제출용 모델은 추가 파일을 import하지 않는 독립 코드입니다.
+  Residual 블록 7개, 두 분류 헤드 크기 256의 확장 모델을 `model.py`에 직접 구현했습니다.
+  추가 모델 파일 없이 `model.py`, `dataset.py`, `train.py` 세 파일만 교체하면 됩니다.
 - [데이터](project1/dataset.py): 완만한 crop·회전·색상 변화·뒤집기. 검증은 공식 Normalize(0.5, 0.5) 유지.
 - [학습](project1/train.py): AdamW(행렬 가중치에 weight decay 적용), warmup/cosine, label smoothing,
   train 라벨 기반 클래스 가중치, CUDA AMP, gradient clipping, raw/EMA 검증 비교.
@@ -34,7 +34,7 @@
 기존 standard 모델은 파라미터 1,301,837개 + 실수형 버퍼 3,072개 = **1,304,909개**,
 FP32 state_dict는 **약 5.01 MiB**입니다. 확장 deep 모델은 파라미터 1,776,293개 + 실수형 버퍼 3,840개
 = **1,780,133개**, state_dict는 **약 6.84 MiB**입니다.
-두 모델 모두 생성과 추론에 `torch` 외 추가 패키지는 필요하지 않습니다.
+현재 모델도 생성과 추론에 `torch` 외 추가 패키지는 필요하지 않습니다.
 학습 이미지 로딩에는 torchvision의 의존성인 Pillow를 사용합니다.
 기법의 조합이 성능 향상을 보장하지 않으며, 전체 학습 후 baseline 대비 개선 여부를 확인해야 합니다.
 
@@ -44,7 +44,7 @@ Colab의 `/content/leaf-cnn/runs/<RUN_NAME>/`에 다음이 남습니다.
 같은 런타임에서는 학습을 재개할 수 있습니다. 런타임이 삭제되면 파일도 사라지므로
 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
 
-- `best_model.pt`, `model.py`: 서로 대응하는 제출용 두 파일. deep 실험에서는 model_deep.py의 내용을 model.py로 저장합니다.
+- `best_model.pt`, `model.py`: 서로 대응하는 제출용 두 파일. 학습에 사용한 model.py를 함께 보관합니다.
 - `last_checkpoint.pt`: 마지막 완료 epoch부터 학습 재개하기 위한 파일. 제출하지 않습니다.
 - `dataset.py`, `train.py`, `config.json`: 당시 코드·설정·소스 해시
 - `best_metrics.json`, `history.csv`, `history.json`, `evaluation.json`, `console.log`: 학습 및 클래스별 검증 결과
@@ -55,6 +55,26 @@ Colab의 `/content/leaf-cnn/runs/<RUN_NAME>/`에 다음이 남습니다.
 baseline과 개선 모델의 기본 학습 기간이 다르므로 기본 비교는 전체 학습 방법의 비교입니다.
 구조만의 효과를 판단하려면 동일한 학습 조건으로 추가 비교하세요.
 
+## 기존 Colab 파일 세 개만 교체하기
+
+기존 학습이 끝난 후 실행합니다. 추가 Python 파일은 필요하지 않습니다.
+
+```python
+%cd /content/Class2026_DL/project1
+from pathlib import Path
+from urllib.request import urlopen
+base = "https://raw.githubusercontent.com/yeonji200522-oss/DeepLearning2026-2/main/project1/"
+names = ["model.py", "dataset.py", "train.py"]
+sources = {name: urlopen(base + name).read() for name in names}
+for name, source in sources.items():
+    Path(name).write_bytes(source)
+    print("교체 완료:", name)
+```
+
+다음 셀에서 `!python train.py`를 실행하면 확장 CNN을 100 epoch 학습합니다.
+기본 저장 경로는 `runs/deep_seed42`이며 종전 `runs/improved_seed42`는 유지합니다.
+이미 새 run이 있으면 `--run_dir runs/deep_seed43 --seed 43`처럼 새 이름을 지정하세요.
+
 ## 로컬 실행
 
 Python과 호환되는 torch/torchvision을 설치하고 공식 저장소의 `student_data_128`을 준비합니다.
@@ -62,11 +82,11 @@ Colab에는 두 라이브러리가 기본 설치되어 있으므로 먼저 버�
 
 ```bash
 cd project1
-python train.py --data_dir /path/to/student_data_128 --run_dir runs/improved_seed42
-python train.py --data_dir /path/to/student_data_128 --run_dir runs/improved_seed42 --resume
-python train.py --data_dir /path/to/student_data_128 --run_dir runs/improved_seed42 --eval_only
-python check_submission.py --model runs/improved_seed42/model.py \
-  --weights runs/improved_seed42/best_model.pt --data_dir /path/to/student_data_128
+python train.py --data_dir /path/to/student_data_128 --run_dir runs/deep_seed42
+python train.py --data_dir /path/to/student_data_128 --run_dir runs/deep_seed42 --resume
+python train.py --data_dir /path/to/student_data_128 --run_dir runs/deep_seed42 --eval_only
+python check_submission.py --model runs/deep_seed42/model.py \
+  --weights runs/deep_seed42/best_model.pt --data_dir /path/to/student_data_128
 ```
 
 재개 시 기존 실험과 동일한 학습 옵션을 전달해야 합니다. 코드가 달라지면 재개를 거부하므로
@@ -83,29 +103,8 @@ EMA는 `--ema_decay 0`으로 별도 실험할 수 있습니다. batch size 변�
 건강 **0.9787**이었습니다. Apple F1은 **0.9195**이며 Apple 360장 중 36장을 Tomato로 예측했습니다.
 이 수치는 사용자가 Colab에서 실행한 로그이며, 테스트 세트 성능이나 다음 설정의 성능은 아직 확인되지 않았습니다.
 
-먼저 증강 없는 train/valid 평가와 오분류 목록으로 과적합 여부와 작물·건강 조합별 오류를 확인합니다.
-진단은 저장한 run의 모델·데이터 소스를 사용하므로 기존 가중치를 바꾸지 않습니다.
-
-```bash
-python diagnose.py --run_dir runs/improved_seed42
-```
-
-다음은 같은 모델 구조에서 본인이 제공 데이터로 처음부터 학습한 최고 가중치만 이어 사용하는
-20 epoch 추가 학습 후보입니다. 외부 사전학습 가중치는 사용하지 않습니다.
-작물 손실 비중과 작물 클래스 균형 보정을 높이고, 잎 형태·색을 더 보존하는 gentle 증강을 사용합니다.
-
-```bash
-python train.py --run_dir runs/crop_refine_seed42 \
-  --init_weights runs/improved_seed42/best_model.pt \
-  --epochs 20 --lr 0.0002 --warmup_epochs 1 \
-  --augmentation gentle --crop_loss_weight 1.25 \
-  --crop_class_weight_power 0.5 --label_smoothing 0.02
-```
-
-새 run은 시작 가중치도 epoch 0 후보로 평가·보관합니다. 이후 점수가 더 낮으면 그 가중치를 유지하며,
-기존 `runs/improved_seed42`는 덮어쓰지 않습니다. 기본 `python train.py` 설정은 종전과 같습니다.
-학습 코드가 변경되었으므로 과거 run을 현재 코드의 `--resume`으로 재개하지 말고,
-추가 실험에는 `--init_weights`와 새 run 폴더를 사용하세요. 목표 0.9800 도달은 보장하지 않습니다.
+현재 `model.py`는 확장 구조이므로 종전 0.9647 모델의 가중치를 불러오지 않고 처음부터 학습합니다.
+과거 모델은 당시 저장한 run 폴더의 `model.py`와 가중치를 함께 사용하세요. 목표 0.9800 도달은 보장하지 않습니다.
 
 ## 1~2시간 예산의 확장 모델 실험
 
@@ -122,7 +121,7 @@ python check_submission.py --model runs/deep_seed42/model.py \
 ```
 
 제출에는 **runs/deep_seed42/model.py와 같은 폴더의 best_model.pt**를 함께 사용하세요.
-루트의 기존 standard model.py와 deep 가중치를 섞으면 구조가 맞지 않습니다.
+과거 standard 모델의 가중치를 현재 확장 model.py와 섞으면 구조가 맞지 않습니다.
 노트북은 현재 런타임에 남아 있는 이전 standard/추가 학습 결과도 공식 검사기로 평가하고 비교합니다.
 공식 평가 전처리는 유지되며 이 추가 실험의 전체 GPU 성능은 아직 확인되지 않았습니다.
 

@@ -1,4 +1,4 @@
-"""A small residual CNN trained from scratch; only torch is required at inference."""
+"""Deeper residual CNN trained from scratch; standalone torch-only submission code."""
 import torch
 from torch import nn
 
@@ -50,10 +50,13 @@ class MultiTaskCNN(nn.Module):
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
+        # Extra 32x32 and 16x16 blocks preserve spatial detail before downsampling.
         self.features = nn.Sequential(
             ResidualBlock(32, 32, 2),
             ResidualBlock(32, 64, 2),
+            ResidualBlock(64, 64),
             ResidualBlock(64, 128, 2),
+            ResidualBlock(128, 128),
             ResidualBlock(128, 128),
             ResidualBlock(128, 192, 2),
         )
@@ -61,15 +64,15 @@ class MultiTaskCNN(nn.Module):
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.crop_features = self._head_features()
         self.health_features = self._head_features()
-        self.crop_head = nn.Linear(128, num_crops)
-        self.health_head = nn.Linear(128, num_health)
+        self.crop_head = nn.Linear(256, num_crops)
+        self.health_head = nn.Linear(256, num_health)
         self._initialize()
 
     @staticmethod
     def _head_features():
         return nn.Sequential(
-            nn.Linear(384, 128),
-            nn.LayerNorm(128),
+            nn.Linear(384, 256),
+            nn.LayerNorm(256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
         )
