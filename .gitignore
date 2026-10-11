@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+project1/student_data_128/
+project1/runs/
+*.pt
+*.pth
