@@ -32,9 +32,10 @@ train 라벨에만 근거한 클래스 가중치와 raw/EMA 검증 비교를 사
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-기본 실험은 3개 설정을 각각 120 epoch 학습한 뒤 한 모델을 선택합니다.
-이전 deep 가중치가 런타임에 있으면 그 가중치로 시작하며, 없으면 처음부터 학습합니다.
-전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요.
+기본 실험은 train 내부 3-fold에서 3개 설정을 각각 100 epoch 학습합니다.
+모든 fold는 처음부터 학습하며, 공식 valid·public 점수로 설정이나 epoch를 선택하지 않습니다.
+선택한 설정으로 전체 train을 다시 학습하고 가중치를 고정한 뒤 공식 valid를 평가합니다.
+전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요. public 0.9820 도달은 보장하지 않습니다.
 """)
 code("""
 import torch
@@ -52,8 +53,11 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 """)
 code("""
 from pathlib import Path
-RUN_NAME = 'max_refine'
-RUN_SEARCH = True
+RUN_NAME = 'generalize_cv'
+RUN_CV = True
+CV_FOLDS = 3
+CV_EPOCHS = 100
+RUN_SEARCH = False
 MODEL_VARIANT = 'deep'  # model.py에 포함된 확장 모델
 SEED = 42
 EPOCHS = 120
@@ -67,7 +71,7 @@ LABEL_SMOOTHING = 0.02
 AUGMENTATION = 'gentle'         # 잎 형태를 더 보존하는 약한 증강; 기존 강도는 'standard'
 OWN_CHECKPOINTS = [Path('/content/Class2026_DL/project1/runs/deep_seed42/best_model.pt'),
                    Path('/content/leaf-cnn/runs/deep_seed42/best_model.pt')]
-INIT_WEIGHTS = next((path for path in OWN_CHECKPOINTS if path.is_file()), None)
+INIT_WEIGHTS = None if RUN_CV else next((path for path in OWN_CHECKPOINTS if path.is_file()), None)
 LEARNING_RATE = 2e-4 if INIT_WEIGHTS is not None else 1e-3
 RUN_BASELINE = False
 BASELINE_EPOCHS = 10
@@ -76,6 +80,7 @@ REFERENCE_RUNS = [
     Path('/content/leaf-cnn/runs/deep_seed42'),
     Path('/content/Class2026_DL/project1/runs/improved_seed42'),
     Path('/content/Class2026_DL/project1/runs/crop_refine_seed42'),
+    Path('/content/Class2026_DL/project1/runs/refined_seed42'),
 ]  # 기존 실험이 현재 런타임에 남아 있으면 함께 공식 검사·비교
 
 RUN_ROOT = Path('/content/leaf-cnn/runs')
@@ -235,12 +240,11 @@ if RUN_BASELINE:
 """)
 markdown("""
 ## 개선 모델 전체 학습
-각 epoch에서 raw와 EMA의 평균 Macro-F1을 비교해 최고 가중치를 저장합니다.
-best_model.pt는 제출용 state_dict이고, last_checkpoint.pt는 optimizer 등을 포함한 재개 전용 파일입니다.
-마지막 epoch까지 무조건 쓰지 않고 전체 학습 중 가장 좋은 검증 결과를 사용합니다.
-RUN_SEARCH=True이면 3개 설정으로 학습하며 마지막 20%는 약한 증강과 hard label을 사용합니다.
-학습 이미지로 BN 통계를 재계산한 SWA 후보도 비교합니다. 같은 출발 가중치가 있으면
-가중치 평균 후보를 검증 점수가 개선될 때만 선택합니다. 최종 제출 모델은 한 개입니다.
+RUN_CV=True이면 train 내부 3-fold에서 이전 deep·촬영 변화 증강·다중 스케일 설정을 비교합니다.
+동일 픽셀 이미지는 한 fold에 묶고 작물/건강 조합을 층화합니다. 각 설정은 같은 fold에서
+정해진 기간으로 처음부터 학습합니다. 점수가 불확실하게 비슷하면 더 단순한 설정을 우선합니다.
+최종 설정과 학습 기간을 먼저 고정하고 전체 train으로 재학습하며 공식 valid는 마지막 보고에만 사용합니다.
+최종 제출 모델은 한 개입니다. CV mean/std와 frozen_selection.json을 확인하세요.
 """)
 code("""
 command = [sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
@@ -256,18 +260,23 @@ if INIT_WEIGHTS is not None:
     command.extend(['--init_weights', str(INIT_WEIGHTS)])
 if RUN_SEARCH:
     command.append('--search')
-if (RUN_DIR / ('config.json' if RUN_SEARCH else 'last_checkpoint.pt')).exists():
+if RUN_CV:
+    command.extend(['--cv', '--cv_folds', str(CV_FOLDS), '--cv_epochs', str(CV_EPOCHS)])
+if (RUN_DIR / ('config.json' if RUN_CV or RUN_SEARCH else 'last_checkpoint.pt')).exists():
     command.append('--resume')
 run_logged(command, WORK, RUN_DIR / 'console.log')
 metrics = json.loads((RUN_DIR / 'best_metrics.json').read_text())
 assert not metrics['smoke_run']
 print('최적 모델:', json.dumps(metrics, ensure_ascii=False, indent=2))
-histories = sorted(RUN_DIR.glob('trial*/history.json')) if RUN_SEARCH else [RUN_DIR / 'history.json']
+histories = ([RUN_DIR / 'final_fit/history.json'] if RUN_CV else
+             sorted(RUN_DIR.glob('trial*/history.json')) if RUN_SEARCH else [RUN_DIR / 'history.json'])
 history = [row for path in histories for row in json.loads(path.read_text())]
-print('epoch | loss | crop F1 | health F1 | 평균 F1 | 초')
+if RUN_CV:
+    print('내부 검증 결과:', (RUN_DIR / 'cv_results.json').read_text())
+    print('미리 고정한 선택:', (RUN_DIR / 'cv_selection.json').read_text())
+print('epoch | loss | 평균 F1 (학습 중 withheld 가능) | 초')
 for row in history:
-    print(f"{row['epoch']:5d} | {row['train_loss']:.4f} | {row['crop_f1']:.4f} | "
-          f"{row['health_f1']:.4f} | {row['score']:.4f} | {row['seconds']:.1f}")
+    print(f"{row['epoch']:5d} | {row['train_loss']:.4f} | {row.get('score', 'withheld')} | {row['seconds']:.1f}")
 """)
 markdown("""
 ## 공식 CPU 검사와 baseline 비교
@@ -298,12 +307,31 @@ for name, directory in candidates:
     assert match, '공식 점수를 찾지 못했습니다.'
     results.append({'name': name, 'score': float(match.group(1)), 'run_dir': str(directory)})
 print('공식 검증 비교:', results)
-selected = max(results, key=lambda row: row['score'])
-print('검증 점수 기준 선택:', selected)
+selected = (next(row for row in results if row['name'] == 'improved') if RUN_CV else
+            max(results, key=lambda row: row['score']))
+print('CV에서 미리 고정한 모델:' if RUN_CV else '검증 점수 기준 선택:', selected)
+if RUN_CV:
+    print('이전 결과와의 valid 비교는 참고용이며 CV에서 고정한 모델을 교체하지 않습니다.')
 if RUN_BASELINE:
     lookup = {row['name']: row['score'] for row in results}
     print('개선 모델 - baseline:', round(lookup['improved'] - lookup['baseline'], 4))
 (RUN_DIR / 'comparison.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
+""")
+markdown("""
+## 이전 모델과 read-only 비교
+남아 있는 이전 모델과 동일 valid에서 오분류·과신 정도·paired bootstrap 구간을 확인합니다.
+구간은 valid 표본의 불확실성만 나타냅니다. public/private 성능을 보장하지 않습니다.
+CV 평균/분산, 클래스별 오류와 이 결과를 함께 검토한 뒤 제출하세요. 자동 제출하지 않습니다.
+""")
+code("""
+references = [path for path in REFERENCE_RUNS if (path / 'model.py').is_file()
+              and (path / 'best_model.pt').is_file()]
+if references:
+    run_logged([sys.executable, '-u', 'train.py', '--compare_runs', str(references[0]), str(RUN_DIR),
+                '--data_dir', str(DATA_DIR), '--run_dir', str(RUN_DIR / 'validation_audit'),
+                '--device', 'cuda'], WORK, RUN_DIR / 'validation_audit.log')
+else:
+    print('이전 가중치가 없어 paired 비교를 생략합니다. 최종 valid 보고서를 먼저 확인하세요.')
 """)
 markdown("""
 ## 제출용 두 파일 묶기·다운로드

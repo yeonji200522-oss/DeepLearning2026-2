@@ -1,5 +1,7 @@
 """Contract and checkpoint tests; set PLANT_DATA_DIR for real-image integration tests."""
 import importlib.util
+import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,9 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT / "project1"
 sys.path.insert(0, str(PROJECT))
 from model import MultiTaskCNN
-from dataset import get_transforms, PlantDataset
+from dataset import get_transforms, PlantDataset, grouped_folds, fold_indices
 from train import (macro_f1, evaluate, load_initial_weights, mix_batch, average_states,
                    recalibrate_bn, configure_regularization)
+from train import paired_bootstrap
 
 spec = importlib.util.spec_from_file_location("official_checker", PROJECT / "check_submission.py")
 checker = importlib.util.module_from_spec(spec)
@@ -58,7 +61,7 @@ class SubmissionContractTests(unittest.TestCase):
         values = torch.arange(128 * 128 * 3).remainder(256).byte().numpy().tobytes()
         image = Image.frombytes("RGB", (128, 128), values)
         torch.testing.assert_close(get_transforms(False)(image), checker.EVAL_TRANSFORM(image), rtol=0, atol=0)
-        for profile in ("standard", "gentle", "detail", "finish"):
+        for profile in ("standard", "gentle", "detail", "finish", "robust"):
             torch.testing.assert_close(get_transforms(False, profile=profile)(image),
                                        checker.EVAL_TRANSFORM(image), rtol=0, atol=0)
             for seed in range(5):
@@ -128,6 +131,42 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertEqual(model[0].momentum, 0.1)
         self.assertFalse(any(module.training for module in model.modules()))
 
+    def test_identical_images_stay_together_and_folds_are_disjoint(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            rows = []
+            for index in range(13):
+                group = index if index < 12 else 0
+                Image.new("RGB", (128, 128), (group * 17, 40, 80)).save(path / f"{index}.png")
+                rows.append({"id": f"{index}.png", "crop_label": str(group % 3),
+                             "health_label": str(group % 2)})
+            data = SimpleNamespace(rows=rows, img_dir=path)
+            result = grouped_folds(data, 3, 2026)
+            assignments = {row["id"]: row["fold"] for row in result["rows"]}
+            self.assertEqual(assignments["0.png"], assignments["12.png"])
+            self.assertEqual(result["identical_image_groups"], 1)
+            self.assertEqual(result, grouped_folds(data, 3, 2026))
+            manifest = path / "folds.json"
+            manifest.write_text(json.dumps(result))
+            validation_union = set()
+            for fold in range(3):
+                train, valid = fold_indices(data, manifest, fold)
+                self.assertFalse(set(train) & set(valid))
+                self.assertEqual(set(train) | set(valid), set(range(13)))
+                self.assertFalse(validation_union & set(valid))
+                validation_union.update(valid)
+
+    def test_paired_bootstrap_identical_models_zero_and_clear_improvement(self):
+        labels = torch.tensor([[crop, health] for crop in range(3) for health in range(2) for _ in range(12)])
+        self.assertEqual(paired_bootstrap(labels, labels, labels, 40)["ci95"], [0.0, 0.0])
+        wrong = labels.clone()
+        wrong[::3, 0] = (wrong[::3, 0] + 1) % 3
+        result = paired_bootstrap(labels, wrong, labels, 100)
+        self.assertGreater(result["delta"], 0)
+        self.assertTrue(result["clear_valid_improvement"])
+        self.assertEqual(result, paired_bootstrap(labels, wrong, labels, 100))
+
     def test_deep_model_standalone_submission_contract(self):
         self.assertEqual(checker.check_imports(str(PROJECT / "model.py")), [])
         model = MultiTaskCNN().eval()
@@ -155,6 +194,113 @@ class SubmissionContractTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("PLANT_DATA_DIR"), "Set PLANT_DATA_DIR to run real-data tests")
 class TrainingIntegrationTests(unittest.TestCase):
+    def tiny_data(self, root, include_valid=True, alter_valid=False):
+        source = Path(os.environ["PLANT_DATA_DIR"]).resolve()
+        root.mkdir()
+        (root / "class_mapping.json").write_bytes((source / "class_mapping.json").read_bytes())
+        for split, limit in (("train", 24), ("valid", 8)):
+            if split == "valid" and not include_valid:
+                continue
+            (root / split).mkdir()
+            (root / split / "images").symlink_to(source / split / "images", target_is_directory=True)
+            with (source / f"{split}.csv").open(encoding="utf-8-sig") as handle:
+                rows = list(csv.DictReader(handle))[:limit]
+            if split == "valid" and alter_valid:
+                for row in rows:
+                    row["crop_label"] = str((int(row["crop_label"]) + 1) % 3)
+                    row["health_label"] = str(1 - int(row["health_label"]))
+            with (root / f"{split}.csv").open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["id", "crop_label", "health_label"])
+                writer.writeheader()
+                writer.writerows(rows)
+
+    def execute(self, arguments):
+        result = subprocess.run([sys.executable, "train.py", *arguments], cwd=PROJECT,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        return result
+
+    def test_internal_fold_training_does_not_need_official_valid(self):
+        with tempfile.TemporaryDirectory(prefix="leaf-fold-") as directory:
+            root = Path(directory)
+            data, run = root / "data", root / "run"
+            self.tiny_data(data, include_valid=False)
+            manifest = root / "folds.json"
+            manifest.write_text(json.dumps(grouped_folds(PlantDataset(data, "train"), 2, 2026)))
+            options = ["--data_dir", str(data), "--run_dir", str(run), "--fold_manifest", str(manifest),
+                       "--fold_index", "0", "--fixed_epochs", "--epochs", "1", "--batch_size", "4",
+                       "--num_workers", "0", "--device", "cpu"]
+            self.execute(options)
+            frozen = json.loads((run / "frozen_selection.json").read_text())
+            self.assertEqual(frozen["validation_source"], "train_fold")
+            self.assertFalse((data / "valid.csv").exists())
+            before = torch.load(run / "best_model.pt", weights_only=True)
+            self.execute(options + ["--resume"])
+            after = torch.load(run / "best_model.pt", weights_only=True)
+            for key in before:
+                torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
+
+    def test_official_validation_labels_cannot_change_fixed_refit_weights(self):
+        with tempfile.TemporaryDirectory(prefix="leaf-frozen-") as directory:
+            root = Path(directory)
+            runs = []
+            for index in range(2):
+                data, run = root / f"data{index}", root / f"run{index}"
+                self.tiny_data(data, alter_valid=bool(index))
+                self.execute(["--data_dir", str(data), "--run_dir", str(run), "--fixed_epochs",
+                              "--epochs", "2", "--batch_size", "4", "--num_workers", "0", "--device", "cpu"])
+                manifest = json.loads((run / "frozen_selection.json").read_text())
+                self.assertFalse(manifest["official_valid_used_for_selection"])
+                self.assertEqual(manifest["weights_sha256_before_validation"],
+                                 hashlib.sha256((run / "best_model.pt").read_bytes()).hexdigest())
+                history = json.loads((run / "history.json").read_text())
+                self.assertTrue(all(row["raw_score"] is None and row["ema_score"] is None for row in history))
+                runs.append(run)
+            before, after = [torch.load(run / "best_model.pt", weights_only=True) for run in runs]
+            for key in before:
+                torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
+            # Read-only comparison uses saved model sources; identical models have exactly zero delta.
+            self.execute(["--data_dir", str(root / "data0"), "--run_dir", str(root / "audit"),
+                          "--compare_runs", *map(str, runs), "--bootstrap", "30", "--num_workers", "0"])
+            report = json.loads((root / "audit/comparison.json").read_text())
+            self.assertEqual(report[1]["paired_vs_first"]["ci95"], [0.0, 0.0])
+            for run in runs:
+                self.assertTrue((root / "audit" / f"errors_{runs.index(run)}_{run.name}.csv").is_file())
+
+    def test_cross_validation_selects_from_train_and_exports_fixed_model(self):
+        with tempfile.TemporaryDirectory(prefix="leaf-cv-") as directory:
+            root = Path(directory)
+            data, run = root / "data", root / "cv"
+            self.tiny_data(data)
+            options = ["--cv", "--data_dir", str(data), "--run_dir", str(run), "--cv_folds", "2",
+                       "--cv_epochs", "1", "--epochs", "2", "--batch_size", "4", "--num_workers", "0",
+                       "--device", "cpu"]
+            self.execute(options)
+            decision = json.loads((run / "cv_selection.json").read_text())
+            self.assertFalse(decision["official_valid_used_for_selection"])
+            self.assertFalse(decision["public_used_for_selection"])
+            self.assertEqual(decision["refit_epochs"], 1)
+            results = json.loads((run / "cv_results.json").read_text())
+            self.assertEqual(len(results), 3)
+            for recipe in results:
+                self.assertEqual(len(recipe["folds"]), 2)
+                for fold in range(2):
+                    child = run / recipe["name"] / f"fold{fold}"
+                    config = json.loads((child / "config.json").read_text())
+                    self.assertIsNone(config["args"]["init_weights"])
+                    self.assertTrue(config["args"]["fixed_epochs"])
+                    frozen = json.loads((child / "frozen_selection.json").read_text())
+                    self.assertEqual(frozen["variant"], "swa" if recipe["name"] == "multiscale" else "ema")
+            model = MultiTaskCNN()
+            model.load_state_dict(torch.load(run / "best_model.pt", weights_only=True))
+            frozen = json.loads((run / "frozen_selection.json").read_text())
+            self.assertEqual(frozen["validation_source"], "official_valid")
+            before = torch.load(run / "best_model.pt", weights_only=True)
+            self.execute(options + ["--resume"])
+            after = torch.load(run / "best_model.pt", weights_only=True)
+            for key in before:
+                torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
+
     def test_search_exports_one_model_retains_starting_score_and_resumes(self):
         from torch.utils.data import DataLoader, Subset
         data = Path(os.environ["PLANT_DATA_DIR"]).resolve()
