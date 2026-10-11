@@ -24,7 +24,7 @@ markdown("""
 이 노트북 안에 model.py / train.py / dataset.py가 포함되어 있으므로 파일을 따로 업로드하거나
 개인 GitHub에 push할 필요가 없습니다. 공식 저장소에서 데이터와 baseline을 자동으로 받습니다.
 
-Residual CNN + BatchNorm + SE attention + 두 출력 헤드의 Dropout,
+더 깊은 Residual CNN + BatchNorm + SE attention + 두 출력 헤드의 Dropout,
 완만한 데이터 증강, AdamW weight decay, warmup/cosine 스케줄,
 train 라벨에만 근거한 클래스 가중치와 raw/EMA 검증 비교를 사용합니다.
 사전학습 가중치는 사용하지 않습니다. 높은 점수는 전체 학습 후 검증으로 확인해야 합니다.
@@ -32,7 +32,8 @@ train 라벨에만 근거한 클래스 가중치와 raw/EMA 검증 비교를 사
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-GPU는 T4로 시작할 수 있으며 전체 실행 시간은 첫 epoch 측정값을 참고하세요.
+기본 실험은 deep 모델 100 epoch입니다. T4에서 1~2시간을 예산으로 잡고,
+실제 전체 실행 시간은 첫 epoch 측정값 × 100으로 확인하세요.
 """)
 code("""
 import torch
@@ -50,19 +51,26 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 """)
 code("""
 from pathlib import Path
-RUN_NAME = 'improved_seed42'
+RUN_NAME = 'deep_seed42'
+MODEL_VARIANT = 'deep'  # 이전 모델은 'standard'
 SEED = 42
-EPOCHS = 40
+EPOCHS = 100
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 3e-4
 CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
-CROP_CLASS_WEIGHT_POWER = None  # 작물만 조정하려면 예: 0.5
-CROP_LOSS_WEIGHT = 1.0          # 작물 손실 비중을 높이려면 예: 1.25
-AUGMENTATION = 'standard'       # 'gentle'은 잎 형태를 더 보존하는 약한 증강
+CROP_CLASS_WEIGHT_POWER = 0.5
+CROP_LOSS_WEIGHT = 1.25
+WARMUP_EPOCHS = 5
+LABEL_SMOOTHING = 0.02
+AUGMENTATION = 'gentle'         # 잎 형태를 더 보존하는 약한 증강; 기존 강도는 'standard'
 INIT_WEIGHTS = None            # 본인이 제공 데이터로 학습한 best_model.pt 경로만 사용
-RUN_BASELINE = True
+RUN_BASELINE = False
 BASELINE_EPOCHS = 10
+REFERENCE_RUNS = [
+    Path('/content/Class2026_DL/project1/runs/improved_seed42'),
+    Path('/content/Class2026_DL/project1/runs/crop_refine_seed42'),
+]  # 기존 실험이 현재 런타임에 남아 있으면 함께 공식 검사·비교
 
 RUN_ROOT = Path('/content/leaf-cnn/runs')
 RUN_DIR = RUN_ROOT / RUN_NAME
@@ -102,7 +110,7 @@ markdown("""
 이미 수정한 파일이 있으면 덮어쓰지 않고 중단합니다. 파일을 편집한 뒤에는 기존 작업 폴더에서 실행하세요.
 """)
 sources = {name: (ROOT / 'project1' / name).read_text(encoding='utf-8')
-           for name in ('model.py', 'dataset.py', 'train.py', 'diagnose.py', 'check_submission.py')}
+           for name in ('model.py', 'model_deep.py', 'dataset.py', 'train.py', 'diagnose.py', 'check_submission.py')}
 code('SOURCES = ' + pprint.pformat(sources, width=100, sort_dicts=False) + '\n\n' + textwrap.dedent("""
 for name, source in SOURCES.items():
     path = WORK / name
@@ -129,9 +137,10 @@ def load_module(name, path):
     return module
 
 data_module = load_module('leaf_dataset', WORK / 'dataset.py')
-model_module = load_module('leaf_model', WORK / 'model.py')
+MODEL_PATH = WORK / ('model_deep.py' if MODEL_VARIANT == 'deep' else 'model.py')
+model_module = load_module('leaf_model', MODEL_PATH)
 checker_module = load_module('leaf_checker', WORK / 'check_submission.py')
-assert not checker_module.check_imports(str(WORK / 'model.py'))
+assert not checker_module.check_imports(str(MODEL_PATH))
 for split, expected in [('train', 8000), ('valid', 2284)]:
     dataset = data_module.PlantDataset(DATA_DIR, split, data_module.get_transforms(False))
     assert len(dataset) == expected, (split, len(dataset))
@@ -181,7 +190,7 @@ def run_logged(command, cwd, log_path):
 
 smoke_dir = Path(tempfile.mkdtemp(prefix='leaf-smoke-', dir='/content'))
 run_logged([sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
-            '--run_dir', str(smoke_dir), '--epochs', '1', '--batch_size', '8',
+            '--run_dir', str(smoke_dir), '--model', MODEL_VARIANT, '--epochs', '1', '--batch_size', '8',
             '--train_limit', '32', '--valid_limit', '32', '--device', 'cuda'],
            WORK, smoke_dir / 'console.log')
 assert json.loads((smoke_dir / 'best_metrics.json').read_text())['smoke_run']
@@ -226,10 +235,12 @@ best_model.pt는 제출용 state_dict이고, last_checkpoint.pt는 optimizer 등
 """)
 code("""
 command = [sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
-           '--run_dir', str(RUN_DIR), '--epochs', str(EPOCHS), '--batch_size', str(BATCH_SIZE),
+           '--run_dir', str(RUN_DIR), '--model', MODEL_VARIANT,
+           '--epochs', str(EPOCHS), '--batch_size', str(BATCH_SIZE),
            '--lr', str(LEARNING_RATE), '--weight_decay', str(WEIGHT_DECAY),
            '--class_weight_power', str(CLASS_WEIGHT_POWER), '--crop_loss_weight', str(CROP_LOSS_WEIGHT),
-           '--augmentation', AUGMENTATION, '--seed', str(SEED), '--device', 'cuda']
+           '--augmentation', AUGMENTATION, '--warmup_epochs', str(WARMUP_EPOCHS),
+           '--label_smoothing', str(LABEL_SMOOTHING), '--seed', str(SEED), '--device', 'cuda']
 if CROP_CLASS_WEIGHT_POWER is not None:
     command.extend(['--crop_class_weight_power', str(CROP_CLASS_WEIGHT_POWER)])
 if INIT_WEIGHTS is not None:
@@ -258,6 +269,9 @@ import re
 candidates = [('improved', RUN_DIR)]
 if RUN_BASELINE:
     candidates.append(('baseline', BASELINE_DIR))
+for reference in REFERENCE_RUNS:
+    if (reference / 'model.py').is_file() and (reference / 'best_model.pt').is_file():
+        candidates.append((reference.name, reference))
 results = []
 for name, directory in candidates:
     checked = subprocess.run(

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT / "project1"
 sys.path.insert(0, str(PROJECT))
 from model import MultiTaskCNN
+from model_deep import MultiTaskCNN as DeepCNN
 from dataset import get_transforms, PlantDataset
 from train import macro_f1, evaluate
 
@@ -76,9 +77,52 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertAlmostEqual(score, (0.5 + 2 / 3 + 0) / 3, places=6)
         self.assertEqual(per_class[2], 0)
 
+    def test_deep_model_standalone_submission_contract(self):
+        self.assertEqual(checker.check_imports(str(PROJECT / "model_deep.py")), [])
+        model = DeepCNN().eval()
+        total = sum(p.numel() for p in model.parameters()) + sum(
+            b.numel() for b in model.buffers() if b.is_floating_point())
+        self.assertLessEqual(total, checker.MAX_PARAMS)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "model.py").write_bytes((PROJECT / "model_deep.py").read_bytes())
+            spec = importlib.util.spec_from_file_location("isolated_deep_submission", path / "model.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            torch.save(model.state_dict(), path / "best_model.pt")
+            self.assertLessEqual((path / "best_model.pt").stat().st_size, checker.MAX_WEIGHT_BYTES)
+            restored = module.MultiTaskCNN().eval()
+            restored.load_state_dict(torch.load(path / "best_model.pt", weights_only=True))
+            with torch.no_grad():
+                images = torch.randn(2, 3, 128, 128)
+                expected = model(images)
+                actual = restored(images)
+            self.assertEqual([tuple(x.shape) for x in actual], [(2, 3), (2, 2)])
+            for before, after in zip(expected, actual):
+                torch.testing.assert_close(before, after, rtol=0, atol=0)
+
 
 @unittest.skipUnless(os.environ.get("PLANT_DATA_DIR"), "Set PLANT_DATA_DIR to run real-data tests")
 class TrainingIntegrationTests(unittest.TestCase):
+    def test_deep_training_exports_matching_model_and_resumes_from_retained_sources(self):
+        with tempfile.TemporaryDirectory(prefix="leaf-deep-") as directory:
+            run = Path(directory) / "run"
+            data = Path(os.environ["PLANT_DATA_DIR"]).resolve()
+            arguments = ["--data_dir", str(data), "--run_dir", str(run), "--model", "deep",
+                         "--epochs", "1", "--batch_size", "4", "--train_limit", "8",
+                         "--valid_limit", "8", "--num_workers", "0", "--device", "cpu"]
+            result = subprocess.run([sys.executable, "train.py", *arguments], cwd=PROJECT,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual((run / "model.py").read_bytes(), (PROJECT / "model_deep.py").read_bytes())
+            self.assertEqual((run / "model_deep.py").read_bytes(), (run / "model.py").read_bytes())
+            restored = DeepCNN()
+            restored.load_state_dict(torch.load(run / "best_model.pt", weights_only=True))
+            # The saved run must be self-contained, including --model deep startup.
+            resumed = subprocess.run([sys.executable, "train.py", *arguments, "--resume"], cwd=run,
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(resumed.returncode, 0, resumed.stdout)
+
     def test_diagnostic_covers_images_and_matches_validation(self):
         from diagnose import inspect_split
         from torch.utils.data import DataLoader

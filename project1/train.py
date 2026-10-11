@@ -3,6 +3,7 @@ import argparse
 import copy
 import csv
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -16,7 +17,6 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 from dataset import PlantDataset, get_transforms, load_class_names
-from model import MultiTaskCNN
 
 
 def atomic_save(value, path):
@@ -106,6 +106,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_dir", default="student_data_128")
     parser.add_argument("--run_dir", default="runs/improved_seed42")
+    parser.add_argument("--model", choices=("standard", "deep"), default="standard",
+                        help="deep adds residual blocks and larger heads; exported model.py matches weights")
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -167,21 +169,29 @@ def main():
         raise RuntimeError("CUDA unavailable; enable a Colab GPU or select --device cpu")
     run_dir = Path(args.run_dir).resolve()
     source_dir = Path(__file__).resolve().parent
+    model_source = source_dir / ("model_deep.py" if args.model == "deep" else "model.py")
+    spec = importlib.util.spec_from_file_location("selected_leaf_model", model_source)
+    model_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(model_module)
     run_dir.mkdir(parents=True, exist_ok=True)
     best_path, last_path = run_dir / "best_model.pt", run_dir / "last_checkpoint.pt"
     if not args.resume and not args.eval_only and any(
         (run_dir / name).exists() for name in ("config.json", "best_model.pt", "last_checkpoint.pt")
     ):
         raise FileExistsError("Run exists: choose a new --run_dir or pass --resume")
-    hashes = {name: hashlib.sha256((source_dir / name).read_bytes()).hexdigest()
-              for name in ("model.py", "dataset.py", "train.py")}
+    source_paths = {"model.py": model_source, "dataset.py": source_dir / "dataset.py",
+                    "train.py": source_dir / "train.py"}
+    hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in source_paths.items()}
     if args.resume or args.eval_only:
         existing = json.loads((run_dir / "config.json").read_text())
         if existing["source_sha256"] != hashes:
             raise ValueError("Source changed since this run; use the saved run sources or a new run")
     else:
-        for name in hashes:
-            shutil.copy2(source_dir / name, run_dir / name)
+        for name, path in source_paths.items():
+            shutil.copy2(path, run_dir / name)
+        if args.model == "deep":
+            # Retain this name too so the saved trainer can resume --model deep.
+            shutil.copy2(model_source, run_dir / "model_deep.py")
         initial_hash = (hashlib.sha256(Path(args.init_weights).read_bytes()).hexdigest()
                         if args.init_weights else None)
         write_json({"args": vars(args), "source_sha256": hashes,
@@ -189,7 +199,7 @@ def main():
                     "torch": torch.__version__, "device": str(device),
                     "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None},
                    run_dir / "config.json")
-    print(f"Device: {device}; run: {run_dir}", flush=True)
+    print(f"Device: {device}; model: {args.model}; run: {run_dir}", flush=True)
     if args.train_limit or args.valid_limit:
         print("SMOKE RUN: subset metrics are not full validation or submission performance.")
     names = load_class_names(args.data_dir)
@@ -200,7 +210,7 @@ def main():
         valid_set = Subset(valid_set, range(min(args.valid_limit, len(valid_set))))
     valid_loader = DataLoader(valid_set, batch_size=args.batch_size, num_workers=args.num_workers,
                               pin_memory=device.type == "cuda")
-    model = MultiTaskCNN().to(device)
+    model = model_module.MultiTaskCNN().to(device)
     count = sum(p.numel() for p in model.parameters()) + sum(
         b.numel() for b in model.buffers() if b.is_floating_point())
     print(f"Parameters + floating buffers: {count:,} / 2,000,000")

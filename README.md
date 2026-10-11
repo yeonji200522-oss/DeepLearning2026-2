@@ -11,10 +11,12 @@
 
 노트북 안에 개선 모델·학습 코드가 포함되어 있어 `train.py` 등의 개별 업로드나 개인 GitHub push가
 필요하지 않습니다. 공식 코드와 학습/검증 데이터를 자동으로 내려받습니다.
-기본 실행은 공식 baseline 10 epoch와 개선 모델 40 epoch를 학습하고, 공식 CPU 검사기로 두 결과를
-비교한 뒤 검증 점수가 높은 모델의 제출 파일을 묶습니다. 실행 시간은 첫 epoch 로그로 확인하세요.
+현재 노트북의 기본 실행은 더 깊은 CNN 100 epoch 학습입니다. 공식 CPU 검사기로 제출 호환성을 확인하고,
+현재 런타임에 남아 있는 이전 실험과 비교한 뒤 검증 점수가 높은 모델의 제출 파일을 묶습니다.
+공식 baseline 10 epoch는 `RUN_BASELINE=True`로 선택할 수 있습니다. T4에서 1~2시간을 예산으로 잡고
+실행 시간은 첫 epoch 로그 × 100으로 확인하세요. 전체 GPU 학습 시간은 아직 측정하지 않았습니다.
 
-첫 실험은 `RUN_NAME='improved_seed42'`로 시작합니다. 새 실험은 RUN_NAME을 바꾸고,
+새 확장 모델 실험은 `RUN_NAME='deep_seed42'`로 시작합니다. 새 실험은 RUN_NAME을 바꾸고,
 중단 후 재개는 같은 RUN_NAME·학습 설정·총 epoch 수를 사용합니다.
 완료한 실험은 덮어쓰지 않습니다. GPU 메모리가 부족하면 새 실험 이름에서 batch size를 32로 줄이세요.
 
@@ -22,13 +24,17 @@
 
 - [모델](project1/model.py): Residual CNN, BatchNorm, SE channel attention, 평균/최대 pooling,
   두 분류 헤드의 LayerNorm과 Dropout(0.2).
+- [확장 모델](project1/model_deep.py): Residual 블록 5→7개, 두 분류 헤드 크기 128→256.
+  `train.py --model deep`으로 선택합니다. 제출용 모델은 추가 파일을 import하지 않는 독립 코드입니다.
 - [데이터](project1/dataset.py): 완만한 crop·회전·색상 변화·뒤집기. 검증은 공식 Normalize(0.5, 0.5) 유지.
 - [학습](project1/train.py): AdamW(행렬 가중치에 weight decay 적용), warmup/cosine, label smoothing,
   train 라벨 기반 클래스 가중치, CUDA AMP, gradient clipping, raw/EMA 검증 비교.
 - [공식 검사기](project1/check_submission.py): 과제 저장소의 코드를 변경 없이 사용.
 
-현재 기본 모델은 파라미터 1,301,837개 + 실수형 버퍼 3,072개 = **1,304,909개**,
-FP32 state_dict는 **약 5.01 MiB**입니다. 생성과 추론에 `torch` 외 추가 패키지는 필요하지 않습니다.
+기존 standard 모델은 파라미터 1,301,837개 + 실수형 버퍼 3,072개 = **1,304,909개**,
+FP32 state_dict는 **약 5.01 MiB**입니다. 확장 deep 모델은 파라미터 1,776,293개 + 실수형 버퍼 3,840개
+= **1,780,133개**, state_dict는 **약 6.84 MiB**입니다.
+두 모델 모두 생성과 추론에 `torch` 외 추가 패키지는 필요하지 않습니다.
 학습 이미지 로딩에는 torchvision의 의존성인 Pillow를 사용합니다.
 기법의 조합이 성능 향상을 보장하지 않으며, 전체 학습 후 baseline 대비 개선 여부를 확인해야 합니다.
 
@@ -38,7 +44,7 @@ Colab의 `/content/leaf-cnn/runs/<RUN_NAME>/`에 다음이 남습니다.
 같은 런타임에서는 학습을 재개할 수 있습니다. 런타임이 삭제되면 파일도 사라지므로
 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
 
-- `best_model.pt`, `model.py`: 서로 대응하는 제출용 두 파일
+- `best_model.pt`, `model.py`: 서로 대응하는 제출용 두 파일. deep 실험에서는 model_deep.py의 내용을 model.py로 저장합니다.
 - `last_checkpoint.pt`: 마지막 완료 epoch부터 학습 재개하기 위한 파일. 제출하지 않습니다.
 - `dataset.py`, `train.py`, `config.json`: 당시 코드·설정·소스 해시
 - `best_metrics.json`, `history.csv`, `history.json`, `evaluation.json`, `console.log`: 학습 및 클래스별 검증 결과
@@ -100,6 +106,25 @@ python train.py --run_dir runs/crop_refine_seed42 \
 기존 `runs/improved_seed42`는 덮어쓰지 않습니다. 기본 `python train.py` 설정은 종전과 같습니다.
 학습 코드가 변경되었으므로 과거 run을 현재 코드의 `--resume`으로 재개하지 말고,
 추가 실험에는 `--init_weights`와 새 run 폴더를 사용하세요. 목표 0.9800 도달은 보장하지 않습니다.
+
+## 1~2시간 예산의 확장 모델 실험
+
+기존 가중치를 보존하고 다른 구조의 deep 모델을 처음부터 100 epoch 학습합니다.
+모델 구조가 다르므로 이전 standard 모델의 가중치를 이 실험의 `--init_weights`로 사용하지 않습니다.
+
+```bash
+python train.py --model deep --run_dir runs/deep_seed42 \
+  --epochs 100 --batch_size 64 --lr 0.001 --warmup_epochs 5 \
+  --augmentation gentle --crop_loss_weight 1.25 \
+  --crop_class_weight_power 0.5 --label_smoothing 0.02
+python check_submission.py --model runs/deep_seed42/model.py \
+  --weights runs/deep_seed42/best_model.pt
+```
+
+제출에는 **runs/deep_seed42/model.py와 같은 폴더의 best_model.pt**를 함께 사용하세요.
+루트의 기존 standard model.py와 deep 가중치를 섞으면 구조가 맞지 않습니다.
+노트북은 현재 런타임에 남아 있는 이전 standard/추가 학습 결과도 공식 검사기로 평가하고 비교합니다.
+공식 평가 전처리는 유지되며 이 추가 실험의 전체 GPU 성능은 아직 확인되지 않았습니다.
 
 ## 검증과 노트북 갱신
 
