@@ -7,7 +7,7 @@
 
 1. **[Colab에서 바로 열기](https://colab.research.google.com/github/yeonji200522-oss/DeepLearning2026-2/blob/main/colab_train.ipynb)**를 누릅니다. 파일 다운로드나 업로드는 필요 없습니다.
 2. **런타임 → 런타임 유형 변경 → GPU**를 선택합니다.
-3. 셀을 위에서부터 실행하고 Google Drive 연결을 인증합니다.
+3. 셀을 위에서부터 실행합니다. Google Drive 연결은 필요 없습니다.
 
 노트북 안에 개선 모델·학습 코드가 포함되어 있어 `train.py` 등의 개별 업로드나 개인 GitHub push가
 필요하지 않습니다. 공식 코드와 학습/검증 데이터를 자동으로 내려받습니다.
@@ -34,7 +34,9 @@ FP32 state_dict는 **약 5.01 MiB**입니다. 생성과 추론에 `torch` 외 �
 
 ## 저장 결과
 
-Drive의 `MyDrive/DeepLearning2026-2/runs/<RUN_NAME>/`에 다음이 남습니다.
+Colab의 `/content/leaf-cnn/runs/<RUN_NAME>/`에 다음이 남습니다.
+같은 런타임에서는 학습을 재개할 수 있습니다. 런타임이 삭제되면 파일도 사라지므로
+종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
 
 - `best_model.pt`, `model.py`: 서로 대응하는 제출용 두 파일
 - `last_checkpoint.pt`: 마지막 완료 epoch부터 학습 재개하기 위한 파일. 제출하지 않습니다.
@@ -62,7 +64,7 @@ python check_submission.py --model runs/improved_seed42/model.py \
 ```
 
 재개 시 기존 실험과 동일한 학습 옵션을 전달해야 합니다. 코드가 달라지면 재개를 거부하므로
-저장한 run 폴더의 코드를 쓰거나 새 실험을 시작하세요. CUDA AMP와 Colab Drive 연결은 Colab GPU에서
+저장한 run 폴더의 코드를 쓰거나 새 실험을 시작하세요. CUDA AMP는 Colab GPU에서
 확인해야 합니다. CPU smoke 학습의 점수를 전체 검증 성능으로 해석하지 마세요.
 
 증강 효과는 `--no_augment`, 불균형 대응은 `--class_weight_power 0` 또는 `0.5`,

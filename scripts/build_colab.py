@@ -29,8 +29,9 @@ Residual CNN + BatchNorm + SE attention + 두 출력 헤드의 Dropout,
 train 라벨에만 근거한 클래스 가중치와 raw/EMA 검증 비교를 사용합니다.
 사전학습 가중치는 사용하지 않습니다. 높은 점수는 전체 학습 후 검증으로 확인해야 합니다.
 
-Google Drive 연결은 처음에 사용자 인증이 필요합니다. 학습은 Colab GPU에서 실행하며,
-가중치·코드·로그는 Drive에 저장합니다. 중단되면 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
+학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
+Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
+런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
 GPU는 T4로 시작할 수 있으며 전체 실행 시간은 첫 epoch 측정값을 참고하세요.
 """)
 code("""
@@ -49,9 +50,6 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 """)
 code("""
 from pathlib import Path
-from google.colab import drive
-
-drive.mount('/content/drive')
 RUN_NAME = 'improved_seed42'
 SEED = 42
 EPOCHS = 40
@@ -62,7 +60,7 @@ CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
 RUN_BASELINE = True
 BASELINE_EPOCHS = 10
 
-RUN_ROOT = Path('/content/drive/MyDrive/DeepLearning2026-2/runs')
+RUN_ROOT = Path('/content/leaf-cnn/runs')
 RUN_DIR = RUN_ROOT / RUN_NAME
 WORK = Path('/content/leaf-cnn/project1')
 WORK.mkdir(parents=True, exist_ok=True)
@@ -293,7 +291,7 @@ with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as bundle:
             assert path.stat().st_size <= 10 * 1024 * 1024
         bundle.write(path, arcname=name)
         print(name, path.stat().st_size, 'bytes', 'sha256:', hashlib.sha256(path.read_bytes()).hexdigest())
-print('Drive 저장 완료:', archive)
+print('Colab 저장 완료:', archive)
 files.download(str(archive))
 """)
 
