@@ -16,7 +16,8 @@ PROJECT = ROOT / "project1"
 sys.path.insert(0, str(PROJECT))
 from model import MultiTaskCNN
 from dataset import get_transforms, PlantDataset
-from train import macro_f1, evaluate
+from train import (macro_f1, evaluate, load_initial_weights, mix_batch, average_states,
+                   recalibrate_bn, configure_regularization)
 
 spec = importlib.util.spec_from_file_location("official_checker", PROJECT / "check_submission.py")
 checker = importlib.util.module_from_spec(spec)
@@ -57,7 +58,7 @@ class SubmissionContractTests(unittest.TestCase):
         values = torch.arange(128 * 128 * 3).remainder(256).byte().numpy().tobytes()
         image = Image.frombytes("RGB", (128, 128), values)
         torch.testing.assert_close(get_transforms(False)(image), checker.EVAL_TRANSFORM(image), rtol=0, atol=0)
-        for profile in ("standard", "gentle"):
+        for profile in ("standard", "gentle", "detail", "finish"):
             torch.testing.assert_close(get_transforms(False, profile=profile)(image),
                                        checker.EVAL_TRANSFORM(image), rtol=0, atol=0)
             for seed in range(5):
@@ -75,6 +76,57 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertAlmostEqual(score, checker.macro_f1(pairs, 3), places=6)
         self.assertAlmostEqual(score, (0.5 + 2 / 3 + 0) / 3, places=6)
         self.assertEqual(per_class[2], 0)
+
+    def test_previous_deep_weights_preserve_predictions_and_reject_incomplete_weights(self):
+        old = MultiTaskCNN().eval()
+        state = {key: value for key, value in old.state_dict().items()
+                 if key != "detail_projection.weight"}
+        restored = MultiTaskCNN().eval()
+        load_initial_weights(restored, state)
+        configure_regularization(restored, dropout=0.1, drop_path=0.2)
+        images = torch.randn(2, 3, 128, 128)
+        # Reproduce the preceding deep architecture's inference, which had no detail branch.
+        with torch.no_grad():
+            x = old.features(old.stem(images))
+            features = torch.cat((old.avg_pool(x).flatten(1), old.max_pool(x).flatten(1)), dim=1)
+            expected = (old.crop_head(old.crop_features(features)),
+                        old.health_head(old.health_features(features)))
+            actual = restored(images)
+        for reference, result in zip(expected, actual):
+            torch.testing.assert_close(reference, result, rtol=0, atol=0)
+        self.assertEqual(restored.detail_projection.weight.count_nonzero().item(), 0)
+        broken = dict(state)
+        broken.pop("stem.0.weight")
+        with self.assertRaises(ValueError):
+            load_initial_weights(restored, broken)
+
+    def test_mixup_pairs_both_labels_and_weight_average_preserves_integer_buffers(self):
+        torch.manual_seed(17)
+        targets = torch.arange(8)
+        images = targets.float().reshape(8, 1, 1, 1).expand(-1, 3, 8, 8)
+        mixed, labels, fraction = mix_batch(images, (targets, targets + 100), 0.2)
+        self.assertGreaterEqual(fraction, 0.5)
+        torch.testing.assert_close(mixed[:, 0, 0, 0], fraction * targets + (1 - fraction) * labels[0])
+        self.assertTrue(torch.equal(labels[0] + 100, labels[1]))
+        left = {"weight": torch.tensor([1.0, 3.0]), "counter": torch.tensor(11)}
+        right = {"weight": torch.tensor([5.0, 7.0]), "counter": torch.tensor(20)}
+        actual = average_states(left, right, 3)
+        torch.testing.assert_close(actual["weight"], torch.tensor([2.0, 4.0]))
+        self.assertEqual(actual["counter"].item(), 11)
+        torch.testing.assert_close(left["weight"], torch.tensor([1.0, 3.0]))
+
+    def test_batch_norm_recalibration_uses_clean_images_and_disables_dropout(self):
+        from torch.utils.data import DataLoader, TensorDataset
+        model = torch.nn.Sequential(torch.nn.BatchNorm2d(3), torch.nn.Dropout(0.9))
+        images = torch.arange(8).float().reshape(8, 1, 1, 1).expand(-1, 3, 4, 4)
+        loader = DataLoader(TensorDataset(images, torch.zeros(8)), batch_size=4)
+        original = model[0].weight.detach().clone()
+        recalibrate_bn(model, loader, torch.device("cpu"))
+        torch.testing.assert_close(model[0].running_mean, torch.full((3,), 3.5))
+        torch.testing.assert_close(model[0].weight, original)
+        self.assertEqual(model[0].num_batches_tracked.item(), 2)
+        self.assertEqual(model[0].momentum, 0.1)
+        self.assertFalse(any(module.training for module in model.modules()))
 
     def test_deep_model_standalone_submission_contract(self):
         self.assertEqual(checker.check_imports(str(PROJECT / "model.py")), [])
@@ -103,6 +155,52 @@ class SubmissionContractTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("PLANT_DATA_DIR"), "Set PLANT_DATA_DIR to run real-data tests")
 class TrainingIntegrationTests(unittest.TestCase):
+    def test_search_exports_one_model_retains_starting_score_and_resumes(self):
+        from torch.utils.data import DataLoader, Subset
+        data = Path(os.environ["PLANT_DATA_DIR"]).resolve()
+        with tempfile.TemporaryDirectory(prefix="leaf-search-") as directory:
+            root = Path(directory)
+            parent = root / "parent"
+            search = root / "search"
+            common = ["--data_dir", str(data), "--epochs", "2", "--batch_size", "4",
+                      "--train_limit", "8", "--valid_limit", "8", "--num_workers", "0",
+                      "--device", "cpu", "--mixup_prob", "1", "--finish_fraction", "0.5"]
+
+            def execute(extra):
+                result = subprocess.run([sys.executable, "train.py", *common, *extra], cwd=PROJECT,
+                                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertEqual(result.returncode, 0, result.stdout)
+
+            execute(["--run_dir", str(parent)])
+            # Simulate the preceding architecture's plain state_dict from a real-data smoke run.
+            weights = torch.load(parent / "best_model.pt", weights_only=True)
+            weights.pop("detail_projection.weight")
+            initial = root / "old_deep.pt"
+            torch.save(weights, initial)
+            arguments = ["--search", "--run_dir", str(search), "--init_weights", str(initial)]
+            execute(arguments)
+            results = json.loads((search / "search_results.json").read_text())
+            self.assertEqual(len(results["candidates"]), 4)
+            self.assertTrue(results["smoke_run"])
+            metrics = json.loads((search / "best_metrics.json").read_text())
+            self.assertGreaterEqual(metrics["score"], max(row["score"] for row in results["candidates"]))
+            saved = torch.load(search / "best_model.pt", weights_only=True)
+            model = MultiTaskCNN().eval()
+            model.load_state_dict(saved)
+            dataset = Subset(PlantDataset(data, "valid", get_transforms(False)), range(8))
+            actual = evaluate(model, DataLoader(dataset, batch_size=4), torch.device("cpu"))
+            self.assertEqual(actual["score"], metrics["score"])
+            for child in search.glob("trial*"):
+                history = json.loads((child / "history.json").read_text())
+                self.assertEqual(history[-1]["augmentation"], "finish")
+                checkpoint = torch.load(child / "last_checkpoint.pt", weights_only=True)
+                self.assertGreater(checkpoint["swa_count"], 0)
+                self.assertFalse((child / "model_deep.py").exists())
+            execute(arguments + ["--resume"])
+            final = torch.load(search / "best_model.pt", weights_only=True)
+            for key in saved:
+                torch.testing.assert_close(saved[key], final[key], rtol=0, atol=0)
+
     def test_three_files_train_and_resume_without_extra_model_file(self):
         with tempfile.TemporaryDirectory(prefix="leaf-deep-") as directory:
             run = Path(directory) / "run"

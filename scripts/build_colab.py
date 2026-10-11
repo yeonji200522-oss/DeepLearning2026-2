@@ -32,8 +32,9 @@ train 라벨에만 근거한 클래스 가중치와 raw/EMA 검증 비교를 사
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-기본 실험은 deep 모델 100 epoch입니다. T4에서 1~2시간을 예산으로 잡고,
-실제 전체 실행 시간은 첫 epoch 측정값 × 100으로 확인하세요.
+기본 실험은 3개 설정을 각각 120 epoch 학습한 뒤 한 모델을 선택합니다.
+이전 deep 가중치가 런타임에 있으면 그 가중치로 시작하며, 없으면 처음부터 학습합니다.
+전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요.
 """)
 code("""
 import torch
@@ -51,12 +52,12 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 """)
 code("""
 from pathlib import Path
-RUN_NAME = 'deep_seed42'
+RUN_NAME = 'max_refine'
+RUN_SEARCH = True
 MODEL_VARIANT = 'deep'  # model.py에 포함된 확장 모델
 SEED = 42
-EPOCHS = 100
+EPOCHS = 120
 BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 3e-4
 CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
 CROP_CLASS_WEIGHT_POWER = 0.5
@@ -64,10 +65,15 @@ CROP_LOSS_WEIGHT = 1.25
 WARMUP_EPOCHS = 5
 LABEL_SMOOTHING = 0.02
 AUGMENTATION = 'gentle'         # 잎 형태를 더 보존하는 약한 증강; 기존 강도는 'standard'
-INIT_WEIGHTS = None            # 본인이 제공 데이터로 학습한 best_model.pt 경로만 사용
+OWN_CHECKPOINTS = [Path('/content/Class2026_DL/project1/runs/deep_seed42/best_model.pt'),
+                   Path('/content/leaf-cnn/runs/deep_seed42/best_model.pt')]
+INIT_WEIGHTS = next((path for path in OWN_CHECKPOINTS if path.is_file()), None)
+LEARNING_RATE = 2e-4 if INIT_WEIGHTS is not None else 1e-3
 RUN_BASELINE = False
 BASELINE_EPOCHS = 10
 REFERENCE_RUNS = [
+    Path('/content/Class2026_DL/project1/runs/deep_seed42'),
+    Path('/content/leaf-cnn/runs/deep_seed42'),
     Path('/content/Class2026_DL/project1/runs/improved_seed42'),
     Path('/content/Class2026_DL/project1/runs/crop_refine_seed42'),
 ]  # 기존 실험이 현재 런타임에 남아 있으면 함께 공식 검사·비교
@@ -232,6 +238,9 @@ markdown("""
 각 epoch에서 raw와 EMA의 평균 Macro-F1을 비교해 최고 가중치를 저장합니다.
 best_model.pt는 제출용 state_dict이고, last_checkpoint.pt는 optimizer 등을 포함한 재개 전용 파일입니다.
 마지막 epoch까지 무조건 쓰지 않고 전체 학습 중 가장 좋은 검증 결과를 사용합니다.
+RUN_SEARCH=True이면 3개 설정으로 학습하며 마지막 20%는 약한 증강과 hard label을 사용합니다.
+학습 이미지로 BN 통계를 재계산한 SWA 후보도 비교합니다. 같은 출발 가중치가 있으면
+가중치 평균 후보를 검증 점수가 개선될 때만 선택합니다. 최종 제출 모델은 한 개입니다.
 """)
 code("""
 command = [sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
@@ -245,13 +254,16 @@ if CROP_CLASS_WEIGHT_POWER is not None:
     command.extend(['--crop_class_weight_power', str(CROP_CLASS_WEIGHT_POWER)])
 if INIT_WEIGHTS is not None:
     command.extend(['--init_weights', str(INIT_WEIGHTS)])
-if (RUN_DIR / 'last_checkpoint.pt').exists():
+if RUN_SEARCH:
+    command.append('--search')
+if (RUN_DIR / ('config.json' if RUN_SEARCH else 'last_checkpoint.pt')).exists():
     command.append('--resume')
 run_logged(command, WORK, RUN_DIR / 'console.log')
 metrics = json.loads((RUN_DIR / 'best_metrics.json').read_text())
 assert not metrics['smoke_run']
 print('최적 모델:', json.dumps(metrics, ensure_ascii=False, indent=2))
-history = json.loads((RUN_DIR / 'history.json').read_text())
+histories = sorted(RUN_DIR.glob('trial*/history.json')) if RUN_SEARCH else [RUN_DIR / 'history.json']
+history = [row for path in histories for row in json.loads(path.read_text())]
 print('epoch | loss | crop F1 | health F1 | 평균 F1 | 초')
 for row in history:
     print(f"{row['epoch']:5d} | {row['train_loss']:.4f} | {row['crop_f1']:.4f} | "

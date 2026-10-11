@@ -47,8 +47,16 @@ class PlantDataset(Dataset):
 def get_transforms(train, augment=True, profile="standard"):
     normalize = transforms.Normalize([0.5] * 3, [0.5] * 3)
     if train and augment:
-        if profile not in ("standard", "gentle"):
+        if profile not in ("standard", "gentle", "detail", "finish"):
             raise ValueError(f"Unknown augmentation profile: {profile}")
+        if profile in ("detail", "finish"):
+            # Preserve all leaf pixels and lesions; quarter turns need no interpolation.
+            operations = [transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip(),
+                          transforms.RandomApply([transforms.RandomRotation((90, 90))], p=0.5)]
+            if profile == "detail":
+                operations.append(transforms.ColorJitter(brightness=0.05, contrast=0.05,
+                                                        saturation=0.04))
+            return transforms.Compose([*operations, transforms.ToTensor(), normalize])
         gentle = profile == "gentle"
         return transforms.Compose([
             transforms.RandomResizedCrop(

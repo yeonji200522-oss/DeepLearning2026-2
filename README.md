@@ -1,63 +1,13 @@
 # DeepLearning2026-2
 
-식물 잎 이미지의 작물 종류(3종)와 건강 상태(2종)를 분류하는 CNN 프로젝트입니다.
-사전학습 가중치 없이 학습하며, 두 과제 Macro-F1의 평균으로 최적 모델을 선택합니다.
+식물 잎 이미지의 작물 3종과 건강 상태 2종을 분류합니다. 외부 사전학습 가중치 없이 제공 데이터만 사용합니다.
+사용자가 보고한 최근 **리더보드** 점수는 평균 Macro-F1 **0.9739**, 작물 **0.9662**, 건강 **0.9817**입니다.
+이전 검증 점수와는 평가 데이터가 다르므로 직접 비교하지 않습니다. 아래 개선안의 전체 GPU 성능은 아직 측정하지 않았습니다.
 
-## Colab에서 시작
+## 기존 Colab에서 실행
 
-1. **[Colab에서 바로 열기](https://colab.research.google.com/github/yeonji200522-oss/DeepLearning2026-2/blob/main/colab_train.ipynb)**를 누릅니다. 파일 다운로드나 업로드는 필요 없습니다.
-2. **런타임 → 런타임 유형 변경 → GPU**를 선택합니다.
-3. 셀을 위에서부터 실행합니다. Google Drive 연결은 필요 없습니다.
-
-노트북 안에 개선 모델·학습 코드가 포함되어 있어 `train.py` 등의 개별 업로드나 개인 GitHub push가
-필요하지 않습니다. 공식 코드와 학습/검증 데이터를 자동으로 내려받습니다.
-현재 노트북의 기본 실행은 더 깊은 CNN 100 epoch 학습입니다. 공식 CPU 검사기로 제출 호환성을 확인하고,
-현재 런타임에 남아 있는 이전 실험과 비교한 뒤 검증 점수가 높은 모델의 제출 파일을 묶습니다.
-공식 baseline 10 epoch는 `RUN_BASELINE=True`로 선택할 수 있습니다. T4에서 1~2시간을 예산으로 잡고
-실행 시간은 첫 epoch 로그 × 100으로 확인하세요. 전체 GPU 학습 시간은 아직 측정하지 않았습니다.
-
-새 확장 모델 실험은 `RUN_NAME='deep_seed42'`로 시작합니다. 새 실험은 RUN_NAME을 바꾸고,
-중단 후 재개는 같은 RUN_NAME·학습 설정·총 epoch 수를 사용합니다.
-완료한 실험은 덮어쓰지 않습니다. GPU 메모리가 부족하면 새 실험 이름에서 batch size를 32로 줄이세요.
-
-## 구현
-
-- [모델](project1/model.py): Residual CNN, BatchNorm, SE channel attention, 평균/최대 pooling,
-  두 분류 헤드의 LayerNorm과 Dropout(0.2).
-  Residual 블록 7개, 두 분류 헤드 크기 256의 확장 모델을 `model.py`에 직접 구현했습니다.
-  추가 모델 파일 없이 `model.py`, `dataset.py`, `train.py` 세 파일만 교체하면 됩니다.
-- [데이터](project1/dataset.py): 완만한 crop·회전·색상 변화·뒤집기. 검증은 공식 Normalize(0.5, 0.5) 유지.
-- [학습](project1/train.py): AdamW(행렬 가중치에 weight decay 적용), warmup/cosine, label smoothing,
-  train 라벨 기반 클래스 가중치, CUDA AMP, gradient clipping, raw/EMA 검증 비교.
-- [공식 검사기](project1/check_submission.py): 과제 저장소의 코드를 변경 없이 사용.
-
-기존 standard 모델은 파라미터 1,301,837개 + 실수형 버퍼 3,072개 = **1,304,909개**,
-FP32 state_dict는 **약 5.01 MiB**입니다. 확장 deep 모델은 파라미터 1,776,293개 + 실수형 버퍼 3,840개
-= **1,780,133개**, state_dict는 **약 6.84 MiB**입니다.
-현재 모델도 생성과 추론에 `torch` 외 추가 패키지는 필요하지 않습니다.
-학습 이미지 로딩에는 torchvision의 의존성인 Pillow를 사용합니다.
-기법의 조합이 성능 향상을 보장하지 않으며, 전체 학습 후 baseline 대비 개선 여부를 확인해야 합니다.
-
-## 저장 결과
-
-Colab의 `/content/leaf-cnn/runs/<RUN_NAME>/`에 다음이 남습니다.
-같은 런타임에서는 학습을 재개할 수 있습니다. 런타임이 삭제되면 파일도 사라지므로
-종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-
-- `best_model.pt`, `model.py`: 서로 대응하는 제출용 두 파일. 학습에 사용한 model.py를 함께 보관합니다.
-- `last_checkpoint.pt`: 마지막 완료 epoch부터 학습 재개하기 위한 파일. 제출하지 않습니다.
-- `dataset.py`, `train.py`, `config.json`: 당시 코드·설정·소스 해시
-- `best_metrics.json`, `history.csv`, `history.json`, `evaluation.json`, `console.log`: 학습 및 클래스별 검증 결과
-- `submission_check.log`, `comparison.json`, `submission.zip`: 공식 검사 결과, baseline 비교, 제출용 묶음
-
-`submission.zip`에는 검사에 통과한 후보 중 검증 점수가 높은 모델의 `model.py`와 `best_model.pt`가
-들어 있습니다. zip을 풀어 두 파일을 리더보드에 직접 제출하세요. 이 프로젝트는 자동 제출하지 않습니다.
-baseline과 개선 모델의 기본 학습 기간이 다르므로 기본 비교는 전체 학습 방법의 비교입니다.
-구조만의 효과를 판단하려면 동일한 학습 조건으로 추가 비교하세요.
-
-## 기존 Colab 파일 세 개만 교체하기
-
-기존 학습이 끝난 후 실행합니다. 추가 Python 파일은 필요하지 않습니다.
+학습을 종료한 상태에서 기존 세 파일만 교체합니다. 추가 Python 파일이나 Drive 연결은 필요 없습니다.
+기존 `runs/deep_seed42`의 모델·가중치는 유지하세요.
 
 ```python
 %cd /content/Class2026_DL/project1
@@ -71,61 +21,92 @@ for name, source in sources.items():
     print("교체 완료:", name)
 ```
 
-다음 셀에서 `!python train.py`를 실행하면 확장 CNN을 100 epoch 학습합니다.
-기본 저장 경로는 `runs/deep_seed42`이며 종전 `runs/improved_seed42`는 유지합니다.
-이미 새 run이 있으면 `--run_dir runs/deep_seed43 --seed 43`처럼 새 이름을 지정하세요.
+다음 셀에서 본인이 제공 데이터로 학습한 deep 최고 모델을 출발점으로 3개 설정을 각각 120 epoch 학습합니다.
+`--init_weights`에는 외부 사전학습 모델을 넣지 마세요. 이전 작은 standard 모델은 구조가 달라 사용할 수 없습니다.
 
-## 로컬 실행
-
-Python과 호환되는 torch/torchvision을 설치하고 공식 저장소의 `student_data_128`을 준비합니다.
-Colab에는 두 라이브러리가 기본 설치되어 있으므로 먼저 버전을 확인하고 임의로 재설치하지 마세요.
-
-```bash
-cd project1
-python train.py --data_dir /path/to/student_data_128 --run_dir runs/deep_seed42
-python train.py --data_dir /path/to/student_data_128 --run_dir runs/deep_seed42 --resume
-python train.py --data_dir /path/to/student_data_128 --run_dir runs/deep_seed42 --eval_only
-python check_submission.py --model runs/deep_seed42/model.py \
-  --weights runs/deep_seed42/best_model.pt --data_dir /path/to/student_data_128
+```python
+!python train.py --search --run_dir runs/max_refine \
+    --init_weights runs/deep_seed42/best_model.pt
 ```
 
-재개 시 기존 실험과 동일한 학습 옵션을 전달해야 합니다. 코드가 달라지면 재개를 거부하므로
-저장한 run 폴더의 코드를 쓰거나 새 실험을 시작하세요. CUDA AMP는 Colab GPU에서
-확인해야 합니다. CPU smoke 학습의 점수를 전체 검증 성능으로 해석하지 마세요.
+새 경로 `runs/max_refine`에 결과를 저장합니다. 각 설정의 최고 raw/EMA 모델, 학습 후 BN 통계 재계산 후보,
+SWA 후보, 시작 모델을 검증하고 최종 한 모델을 저장합니다. 같은 출발점에서 학습한 가중치를 평균하는 후보도
+검증 점수가 높아질 때만 선택합니다. 선택한 모델의 검증 점수는 포함한 시작 모델보다 낮아지지 않으며,
+**리더보드 점수의 개선이나 0.9800 도달은 보장하지 않습니다.** test 라벨을 학습이나 선택에 사용하지 않습니다.
 
-증강 효과는 `--no_augment`, 불균형 대응은 `--class_weight_power 0` 또는 `0.5`,
-EMA는 `--ema_decay 0`으로 별도 실험할 수 있습니다. batch size 변경 시에도 새 run을 사용하세요.
-최종 후보는 seed 42/43/44로 재학습해 성능 변동을 확인하는 것을 권장합니다.
+완료 후 공식 검사기를 실행합니다.
 
-## 0.9800 목표를 위한 다음 실험
-
-첫 전체 학습의 검증 평균 Macro-F1은 **0.9647**(34 epoch EMA), 작물 **0.9507**,
-건강 **0.9787**이었습니다. Apple F1은 **0.9195**이며 Apple 360장 중 36장을 Tomato로 예측했습니다.
-이 수치는 사용자가 Colab에서 실행한 로그이며, 테스트 세트 성능이나 다음 설정의 성능은 아직 확인되지 않았습니다.
-
-현재 `model.py`는 확장 구조이므로 종전 0.9647 모델의 가중치를 불러오지 않고 처음부터 학습합니다.
-과거 모델은 당시 저장한 run 폴더의 `model.py`와 가중치를 함께 사용하세요. 목표 0.9800 도달은 보장하지 않습니다.
-
-## 1~2시간 예산의 확장 모델 실험
-
-기존 가중치를 보존하고 다른 구조의 deep 모델을 처음부터 100 epoch 학습합니다.
-모델 구조가 다르므로 이전 standard 모델의 가중치를 이 실험의 `--init_weights`로 사용하지 않습니다.
-
-```bash
-python train.py --model deep --run_dir runs/deep_seed42 \
-  --epochs 100 --batch_size 64 --lr 0.001 --warmup_epochs 5 \
-  --augmentation gentle --crop_loss_weight 1.25 \
-  --crop_class_weight_power 0.5 --label_smoothing 0.02
-python check_submission.py --model runs/deep_seed42/model.py \
-  --weights runs/deep_seed42/best_model.pt
+```python
+!python check_submission.py --model runs/max_refine/model.py \
+    --weights runs/max_refine/best_model.pt --data_dir student_data_128
 ```
 
-제출에는 **runs/deep_seed42/model.py와 같은 폴더의 best_model.pt**를 함께 사용하세요.
-과거 standard 모델의 가중치를 현재 확장 model.py와 섞으면 구조가 맞지 않습니다.
-노트북은 현재 런타임에 남아 있는 이전 standard/추가 학습 결과도 공식 검사기로 평가하고 비교합니다.
-공식 평가 전처리는 유지되며 이 추가 실험의 전체 GPU 성능은 아직 확인되지 않았습니다.
+제출 파일은 **같은 폴더의 `model.py`와 `best_model.pt`**입니다. 새 모델 파일과 과거 가중치를 직접 짝지어 제출하지 마세요.
 
-## 검증과 노트북 갱신
+```python
+import zipfile
+from google.colab import files
+with zipfile.ZipFile('/content/submission.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+    for name in ['model.py', 'best_model.pt']:
+        archive.write('runs/max_refine/' + name, arcname=name)
+files.download('/content/submission.zip')
+```
+
+학습이 중단되면 같은 런타임에서 같은 명령에 `--resume`을 추가합니다.
+이미 완료한 child 실험은 추가 epoch를 학습하지 않고 재사용합니다. 설정·소스·출발 가중치가 바뀌면 재개를 거부합니다.
+런타임이 삭제되면 `/content`의 파일도 사라지므로 제출 파일과 필요한 체크포인트를 다운로드하세요.
+
+```python
+!python train.py --search --run_dir runs/max_refine \
+    --init_weights runs/deep_seed42/best_model.pt --resume
+```
+
+이전 최고 가중치가 없는 새 런타임에서는 `--init_weights`를 생략할 수 있습니다.
+이때 각 실험을 처음부터 학습하고, 채널이 정렬되지 않은 서로 다른 초기화의 가중치는 평균하지 않습니다.
+단일 실험은 `!python train.py`로 120 epoch 학습합니다. 기본 경로는 `runs/refined_seed42`입니다.
+같은 run 이름을 덮어쓰지 않으므로 새 실험에는 다른 `--run_dir`을 사용하세요.
+
+## 개선 내용과 제한
+
+- [model.py](project1/model.py): 7개 Residual 블록, BatchNorm, SE attention, 평균/최대 pooling,
+  두 LayerNorm/Dropout 분류 헤드. 16×16 중간 특징과 8×8 최종 특징을 결합하는 경로를 추가했습니다.
+  새 경로의 0 초기화 덕분에 과거 deep 가중치를 학습용으로 가져오면 이전 예측을 정확히 재현합니다.
+  추론 함수는 입력 이미지 한 장으로 예측하며 평가 시 추가 이미지 증강을 하지 않습니다.
+- [dataset.py](project1/dataset.py): gentle/standard 증강 외에 전체 잎·병변 픽셀을 보존하는 detail/finish 증강.
+  학습 후반 20%는 crop·색상 변화를 줄이고 MixUp과 label smoothing을 해제합니다.
+  평가 전처리는 공식 **ToTensor + Normalize(mean=0.5, std=0.5)** 그대로입니다.
+- [train.py](project1/train.py): AdamW weight decay, warmup/cosine, train 라벨 기반 클래스 가중치,
+  CUDA AMP, gradient clipping, MixUp, 학습 전용 stochastic depth, EMA와 SWA.
+  BN 통계 재계산에는 **증강 없는 train 이미지**만 사용하고 dropout은 끕니다.
+  `--search`는 세 설정·seed를 비교하며 최종 가중치를 평균하더라도 모델은 한 개입니다.
+- [check_submission.py](project1/check_submission.py): 공식 검사기를 변경 없이 보존했습니다.
+
+현재 모델은 파라미터 **1,874,597개** + 실수형 버퍼 **3,840개** = **1,878,437개**로 2M 이내입니다.
+FP32 `state_dict`는 **약 7.22 MiB(7.57 MB)**로 10 MB 이내입니다. 제출 `model.py`는 torch와 표준 라이브러리만 사용합니다.
+이미지 로딩에 사용하는 Pillow는 torchvision의 의존성입니다. 데이터와 가중치는 GitHub에 올리지 않습니다.
+
+`--search`의 설정은 gentle + 약한 MixUp, detail + MixUp 없음, standard + MixUp의 세 후보입니다.
+각각 dropout·stochastic depth·학습률·규제를 달리하고 검증 Macro-F1의 평균으로 선택합니다.
+독립적으로 초기화된 모델을 임의로 평균하거나 여러 모델을 제출 파일 안에 숨기지 않습니다.
+
+## 결과와 재현
+
+최종 run에는 `model.py`, `best_model.pt`, `best_metrics.json`, `evaluation.json`, `search_results.json`이 남습니다.
+`trial1_seed42`, `trial2_seed43`, `trial3_seed44`에는 각각 소스, 설정/해시, epoch 기록, 재개용 `last_checkpoint.pt`를 보관합니다.
+단일 실험은 같은 구조의 기록을 해당 run에 바로 저장합니다. `last_checkpoint.pt`는 제출 파일이 아니며 10 MB 제한 대상이 아닙니다.
+
+`--eval_only`, `--no_augment`, `--mixup_alpha 0`, `--swa_start 1`, `--ema_decay 0`,
+`--no_bn_recalibration`으로 단일 실험에서 각 효과를 확인할 수 있습니다.
+`--class_weight_power`와 과제별 `--crop_class_weight_power`, `--health_class_weight_power`도 설정할 수 있습니다.
+과제별 설정이 전체 설정보다 우선합니다. 재개에는 같은 학습 옵션과 총 epoch 수를 유지하세요.
+
+## 자동 준비 노트북과 검증
+
+[Colab에서 열기](https://colab.research.google.com/github/yeonji200522-oss/DeepLearning2026-2/blob/main/colab_train.ipynb)를 사용하면
+공식 코드·데이터와 학습 파일을 자동으로 준비합니다. GPU 런타임을 선택하고 셀을 순서대로 실행하세요.
+노트북은 현재 런타임의 이전 deep 가중치를 자동으로 찾고, 있으면 추가 학습하고 없으면 처음부터 학습합니다.
+최종 후보와 남아 있는 이전 실험을 공식 CPU 검사기로 비교한 뒤 제출 ZIP을 다운로드합니다.
+Drive는 사용하지 않으며 리더보드 자동 제출도 하지 않습니다.
 
 ```bash
 python -m unittest discover -s tests -v
@@ -133,8 +114,10 @@ PLANT_DATA_DIR=/path/to/student_data_128 python -m unittest discover -s tests -v
 python scripts/build_colab.py
 ```
 
-실제 데이터 경로를 지정하면 epoch checkpoint에서 끊긴 학습의 재개 결과와 연속 학습 결과가
-동일한지도 검사합니다. 모델·학습 파일을 편집한 뒤에는 `build_colab.py`로 노트북에 소스를 다시 넣으세요.
-코드·데이터의 출처는 [Class2026_DL/project1](https://github.com/maygodwithu/Class2026_DL/tree/main/project1)이며,
-노트북은 확인한 공식 커밋 `c0c7737fa2355cf57bf78792b376bf770aa950dd`를 고정해서 사용합니다.
+테스트는 출력 규격·크기·가중치 호환성·평가 전처리·MixUp 라벨 대응·BN 재계산을 확인합니다.
+실제 데이터 경로를 지정하면 학습 중단/재개, SWA 저장, 세 파일만으로 학습, search와 단일 모델 내보내기도 검사합니다.
+CPU 소규모 학습 점수는 전체 학습 성능이 아닙니다. CUDA AMP와 전체 성능은 Colab GPU에서 확인해야 합니다.
+
+데이터·과제 규격 출처는 [Class2026_DL/project1](https://github.com/maygodwithu/Class2026_DL/tree/main/project1)입니다.
+자동 준비 노트북은 공식 커밋 `c0c7737fa2355cf57bf78792b376bf770aa950dd`를 고정해 사용합니다.
 기존 `model_py.ipynb`는 보존했습니다.
