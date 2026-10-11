@@ -2,6 +2,7 @@
 import argparse
 import copy
 import csv
+from datetime import datetime
 import hashlib
 import importlib.util
 import json
@@ -196,7 +197,8 @@ class ModelEMA:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_dir", default="student_data_128")
-    parser.add_argument("--run_dir", default="runs/refined_seed42")
+    parser.add_argument("--run_dir", default=None,
+                        help="New runs default to a unique timestamped folder under runs/")
     parser.add_argument("--model", choices=("deep",), default="deep",
                         help="model.py contains the deep CNN; no separate model file is required")
     parser.add_argument("--epochs", type=int, default=120)
@@ -259,6 +261,18 @@ def parse_args():
     parser.add_argument("--train_limit", type=int, default=0, help="Smoke checks only, 0 uses all data")
     parser.add_argument("--valid_limit", type=int, default=0, help="Smoke checks only, 0 uses all data")
     args = parser.parse_args()
+    if args.run_dir is None:
+        if args.resume or args.eval_only:
+            # Preserve the legacy default; timestamped runs should specify their saved path.
+            args.run_dir = "runs/refined_seed42"
+        else:
+            mode = "cv" if args.cv else "search" if args.search else "audit" if args.compare_runs else "single"
+            base = Path("runs") / f"{mode}_seed{args.seed}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+            selected, suffix = base, 1
+            while selected.exists():
+                selected = base.with_name(f"{base.name}_{suffix}")
+                suffix += 1
+            args.run_dir = str(selected)
     args.data_dir = str(Path(args.data_dir).resolve())
     if args.init_weights:
         args.init_weights = str(Path(args.init_weights).resolve())

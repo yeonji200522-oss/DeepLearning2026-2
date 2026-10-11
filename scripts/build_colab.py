@@ -32,9 +32,9 @@ train 라벨에만 근거한 클래스 가중치와 raw/EMA 검증 비교를 사
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-기본 실험은 train 내부 3-fold에서 3개 설정을 각각 100 epoch 학습합니다.
-모든 fold는 처음부터 학습하며, 공식 valid·public 점수로 설정이나 epoch를 선택하지 않습니다.
-선택한 설정으로 전체 train을 다시 학습하고 가중치를 고정한 뒤 공식 valid를 평가합니다.
+기본 실험은 전체 train으로 한 모델을 120 epoch 학습하고 매 epoch 공식 valid를 평가합니다.
+valid 평균 Macro-F1이 가장 높은 단일 모델의 가중치를 저장합니다.
+교차검증은 기본값에서 실행하지 않습니다. RUN_CV=True로 선택할 수 있습니다.
 전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요. public 0.9820 도달은 보장하지 않습니다.
 """)
 code("""
@@ -53,8 +53,9 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 """)
 code("""
 from pathlib import Path
-RUN_NAME = 'generalize_cv'
-RUN_CV = True
+from datetime import datetime
+RUN_NAME = 'single_seed42_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+RUN_CV = False
 CV_FOLDS = 3
 CV_EPOCHS = 100
 RUN_SEARCH = False
@@ -71,7 +72,7 @@ LABEL_SMOOTHING = 0.02
 AUGMENTATION = 'gentle'         # 잎 형태를 더 보존하는 약한 증강; 기존 강도는 'standard'
 OWN_CHECKPOINTS = [Path('/content/Class2026_DL/project1/runs/deep_seed42/best_model.pt'),
                    Path('/content/leaf-cnn/runs/deep_seed42/best_model.pt')]
-INIT_WEIGHTS = None if RUN_CV else next((path for path in OWN_CHECKPOINTS if path.is_file()), None)
+INIT_WEIGHTS = None  # 기본은 처음부터 학습; 추가 학습 시에만 직접 경로를 지정
 LEARNING_RATE = 2e-4 if INIT_WEIGHTS is not None else 1e-3
 RUN_BASELINE = False
 BASELINE_EPOCHS = 10
@@ -240,6 +241,7 @@ if RUN_BASELINE:
 """)
 markdown("""
 ## 개선 모델 전체 학습
+기본 RUN_CV=False는 전체 train으로 한 모델을 학습하고 valid 최고 가중치를 저장합니다.
 RUN_CV=True이면 train 내부 3-fold에서 이전 deep·촬영 변화 증강·다중 스케일 설정을 비교합니다.
 동일 픽셀 이미지는 한 fold에 묶고 작물/건강 조합을 층화합니다. 각 설정은 같은 fold에서
 정해진 기간으로 처음부터 학습합니다. 점수가 불확실하게 비슷하면 더 단순한 설정을 우선합니다.

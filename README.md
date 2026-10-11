@@ -5,6 +5,16 @@
 이전 public 최고는 0.9739입니다. valid와 public은 다른 데이터이며, 이 차이만으로 과적합이나 분포 변화를 단정하지 않습니다.
 목표 public 0.9820 도달은 보장할 수 없습니다. 아래 절차의 전체 GPU 성능은 아직 확인하지 않았습니다.
 
+## 기존 단일 학습 방식
+
+세 파일을 교체한 뒤 기존처럼 `!python train.py`를 실행합니다. 교차검증은 실행하지 않습니다.
+전체 train으로 한 모델을 학습하고 매 epoch 공식 valid 평균 Macro-F1이 가장 높은 가중치를 저장합니다.
+저장 폴더를 지정하지 않으면 `runs/single_seed42_<날짜와 시간>`을 자동 생성하므로 반복 실행해도
+기존 기록과 충돌하지 않습니다. 시작 로그의 `run:`에 표시된 경로에서 `model.py`와 `best_model.pt`를 사용하세요.
+`--run_dir`을 직접 지정하면 기존처럼 해당 폴더를 사용하며 덮어쓰기를 막습니다.
+이어 학습할 때는 `!python train.py --run_dir runs/실제_저장폴더 --resume`을 사용합니다.
+모델·학습 설정·평가 전처리는 이번 저장 경로 수정으로 변경하지 않았습니다.
+
 ## 먼저 기존 모델을 같은 valid에서 비교
 
 기존 Colab에서 학습을 종료한 상태로 세 파일만 교체합니다. 추가 Python 파일과 Drive 연결은 필요 없습니다.
@@ -35,9 +45,9 @@ for name, source in sources.items():
 첫 모델 대비 paired bootstrap 차이와 95% 구간도 계산합니다. 구간이 0을 포함하면 작은 valid 차이를 확실한 개선으로
 취급하지 마세요. 이 구간은 **valid 표본의 불확실성**이며 public/private 성능에 대한 보장이 아닙니다.
 
-## train 내부 교차 검증 후 최종 모델 고정
+## 선택 기능: train 내부 교차 검증 후 최종 모델 고정
 
-동일한 official valid에서 매 epoch와 여러 후보를 계속 고르는 방식의 선택 편향을 줄이기 위한 새 기본 권장 절차입니다.
+필요할 때만 `--cv`로 선택하는 절차입니다. 기본 단일 학습에는 적용되지 않습니다.
 
 ```python
 !python train.py --cv --run_dir runs/generalize_cv
@@ -109,7 +119,7 @@ files.download('/content/submission.zip')
 
 `--init_weights`는 일반 추가 학습에만 사용할 수 있습니다. **CV/fold/fixed refit에서는 금지**합니다.
 전체 train으로 학습한 가중치는 내부 held-out 이미지도 이미 보았기 때문입니다.
-과거 `--search`는 동일 valid에서 여러 후보를 비교하는 방식으로 남아 있지만 새로운 기본 권장은 `--cv`입니다.
+`--search`는 동일 valid에서 여러 후보를 비교하는 선택 기능으로 남아 있습니다.
 `!python train.py`만 실행하면 종전 단일 학습이므로 새 절차에는 반드시 **`--cv`**를 붙이세요.
 
 ## 모델·라이브러리 제한과 검증
@@ -134,6 +144,6 @@ CV 선택/최종 단일 모델 내보내기, read-only 비교와 paired bootstra
 CUDA AMP와 전체 성능은 Colab에서 확인해야 합니다.
 
 [자동 준비 Colab](https://colab.research.google.com/github/yeonji200522-oss/DeepLearning2026-2/blob/main/colab_train.ipynb)는
-새 CV 절차를 기본값으로 사용합니다. GPU 런타임에서 셀을 순서대로 실행하고 제출 전에 보고서를 검토하세요.
+기존 단일 학습을 기본값으로 사용합니다. GPU 런타임에서 셀을 순서대로 실행하고 제출 전에 보고서를 검토하세요.
 Drive를 사용하지 않습니다. 데이터·과제 규격은 [Class2026_DL/project1](https://github.com/maygodwithu/Class2026_DL/tree/main/project1)에서 왔으며,
 자동 준비는 공식 커밋 `c0c7737fa2355cf57bf78792b376bf770aa950dd`를 고정합니다. 기존 `model_py.ipynb`는 보존했습니다.
