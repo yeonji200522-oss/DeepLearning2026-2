@@ -80,6 +80,20 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertAlmostEqual(score, (0.5 + 2 / 3 + 0) / 3, places=6)
         self.assertEqual(per_class[2], 0)
 
+    def test_crop_spatial_route_changes_crop_without_changing_health(self):
+        torch.manual_seed(23)
+        model = MultiTaskCNN().eval()
+        images = torch.randn(2, 3, 128, 128)
+        with torch.no_grad():
+            before = model(images)
+            model.crop_layout[-1].weight.fill_(0.05)
+            after = model(images)
+        self.assertFalse(torch.allclose(before[0], after[0]))
+        torch.testing.assert_close(before[1], after[1], rtol=0, atol=0)
+        model.zero_grad(set_to_none=True)
+        model(images)[1].square().sum().backward()
+        self.assertTrue(all(p.grad is None for p in model.crop_layout.parameters()))
+
     def test_compatible_weights_preserve_predictions_and_reject_incomplete_or_old_architecture(self):
         old = MultiTaskCNN().eval()
         state = {key: value for key, value in old.state_dict().items()

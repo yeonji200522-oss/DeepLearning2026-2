@@ -255,7 +255,7 @@ def parse_args():
                         help="New runs default to a unique timestamped folder under runs/")
     parser.add_argument("--model", choices=("deep",), default="deep",
                         help="model.py contains the deep CNN; no separate model file is required")
-    parser.add_argument("--epochs", type=int, default=160)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=None,
                         help="Defaults to 0.0002 with own starting weights, otherwise 0.001")
@@ -264,11 +264,11 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=3e-4)
     parser.add_argument("--class_weight_power", type=float, default=0.35,
                         help="0 disables class weighting; only train labels determine weights")
-    parser.add_argument("--crop_class_weight_power", type=float, default=0.5,
+    parser.add_argument("--crop_class_weight_power", type=float, default=0.6,
                         help="Override class_weight_power for the crop task only")
     parser.add_argument("--health_class_weight_power", type=float, default=None,
                         help="Override class_weight_power for the health task only")
-    parser.add_argument("--crop_loss_weight", type=float, default=1.25)
+    parser.add_argument("--crop_loss_weight", type=float, default=1.5)
     parser.add_argument("--health_loss_weight", type=float, default=1.0)
     parser.add_argument("--augmentation", choices=("standard", "gentle", "detail", "finish", "robust", "leaf"),
                         default="leaf")

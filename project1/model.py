@@ -79,17 +79,27 @@ class MultiTaskCNN(nn.Module):
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         # Fuse 16x16 detail features with 8x8 semantic features without enlarging the backbone.
         self.detail_projection = nn.Linear(256, 384, bias=False)
-        self.crop_features = self._head_features()
+        # Preserve coarse spatial layout for crop identification rather than pooling it all away.
+        self.crop_layout = nn.Sequential(
+            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.Flatten(),
+            nn.Linear(512, 64, bias=False),
+            nn.LayerNorm(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 320, bias=False),
+        )
+        self.crop_features = self._head_features(320)
         self.health_features = self._head_features()
-        self.crop_head = nn.Linear(256, num_crops)
+        self.crop_head = nn.Linear(320, num_crops)
         self.health_head = nn.Linear(256, num_health)
         self._initialize()
 
     @staticmethod
-    def _head_features():
+    def _head_features(width=256):
         return nn.Sequential(
-            nn.Linear(384, 256),
-            nn.LayerNorm(256),
+            nn.Linear(384, width),
+            nn.LayerNorm(width),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
         )
@@ -113,16 +123,19 @@ class MultiTaskCNN(nn.Module):
                 nn.init.zeros_(module.bn2.weight)
         # Let the backbone learn first before the detail fusion grows from zero.
         nn.init.zeros_(self.detail_projection.weight)
+        # Start the extra crop route at zero so it can learn gradually.
+        nn.init.zeros_(self.crop_layout[-1].weight)
 
     def forward(self, x):
         x = self.stem(x)
         for index, block in enumerate(self.features):
             x = block(x)
             if index == len(self.features) - 2:
+                detail_map = x
                 detail = torch.cat((self.avg_pool(x).flatten(1), self.max_pool(x).flatten(1)), dim=1)
         features = torch.cat((self.avg_pool(x).flatten(1), self.max_pool(x).flatten(1)), dim=1)
         features = features + self.detail_projection(detail)
         return (
-            self.crop_head(self.crop_features(features)),
+            self.crop_head(self.crop_features(features) + self.crop_layout(detail_map)),
             self.health_head(self.health_features(features)),
         )

@@ -25,6 +25,7 @@ markdown("""
 개인 GitHub에 push할 필요가 없습니다. 공식 저장소에서 데이터와 baseline을 자동으로 받습니다.
 
 Residual CNN + 7×7 depthwise 공간 특징 + SE attention + 다중 스케일 pooling,
+작물 전용 2×2 공간 pooling 경로와 확장한 분류 헤드,
 BatchNorm·Dropout·AdamW weight decay, 잎 전체를 보존하는 증강,
 SAM 최적화, warmup/cosine, 클래스 가중치와 EMA·SWA를 사용합니다.
 사전학습 가중치는 사용하지 않습니다. 높은 점수는 전체 학습 후 검증으로 확인해야 합니다.
@@ -32,7 +33,7 @@ SAM 최적화, warmup/cosine, 클래스 가중치와 EMA·SWA를 사용합니다
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-기본 실험은 전체 train으로 한 모델을 처음부터 160 epoch 학습하고 매 epoch 공식 valid를 평가합니다.
+기본 실험은 전체 train으로 한 모델을 처음부터 200 epoch 학습하고 매 epoch 공식 valid를 평가합니다.
 valid 평균 Macro-F1이 가장 높은 단일 모델의 가중치를 저장합니다.
 교차검증은 기본값에서 실행하지 않습니다. RUN_CV=True로 선택할 수 있습니다.
 SAM은 배치마다 두 번 순전파·역전파하므로 일반 AdamW보다 오래 걸립니다.
@@ -62,12 +63,12 @@ CV_EPOCHS = 100
 RUN_SEARCH = False
 MODEL_VARIANT = 'deep'  # model.py에 포함된 확장 모델
 SEED = 42
-EPOCHS = 160
+EPOCHS = 200
 BATCH_SIZE = 64
 WEIGHT_DECAY = 3e-4
 CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
-CROP_CLASS_WEIGHT_POWER = 0.5
-CROP_LOSS_WEIGHT = 1.25
+CROP_CLASS_WEIGHT_POWER = 0.6
+CROP_LOSS_WEIGHT = 1.5
 WARMUP_EPOCHS = 5
 LABEL_SMOOTHING = 0.02
 AUGMENTATION = 'leaf'           # 큰 crop 없이 잎 전체·병반 보존
