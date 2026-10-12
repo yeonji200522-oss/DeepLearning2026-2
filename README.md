@@ -1,24 +1,17 @@
 # DeepLearning2026-2
 
-식물 잎 이미지의 작물 3종과 건강 상태 2종을 분류합니다. 외부 사전학습 가중치 없이 제공 데이터만 사용합니다.
-사용자가 보고한 최근 결과는 **valid 평균 Macro-F1 0.9822**(작물 0.9736, 건강 0.9908), **public 0.9723**입니다.
-이전 public 최고는 0.9739입니다. valid와 public은 다른 데이터이며, 이 차이만으로 과적합이나 분포 변화를 단정하지 않습니다.
-목표 public 0.9820 도달은 보장할 수 없습니다. 아래 절차의 전체 GPU 성능은 아직 확인하지 않았습니다.
+식물 잎 이미지의 작물 3종과 건강 상태 2종을 분류합니다. 목표는 평균 Macro-F1을 더 높이는 것입니다.
+최신 실험은 **기존 best_model.pt 업로드 없이 처음부터 학습**합니다. 기본 실행은 한 모델의 단일 학습이며
+교차검증과 여러 recipe 검색을 실행하지 않습니다. 외부 사전학습 가중치를 사용하지 않습니다.
 
-## 기존 단일 학습 방식
+사용자가 제공한 이전 public 최고는 **0.9739**(작물 0.9662, 건강 0.9817)입니다.
+최신 실험의 public **0.9900**은 목표이며, 도달 여부와 전체 GPU 성능은 아직 확인하지 않았습니다.
+이후 다른 모델에서 나온 valid 0.9822/public 0.9723을 이 새 모델의 성능으로 기재하지 않습니다.
 
-세 파일을 교체한 뒤 기존처럼 `!python train.py`를 실행합니다. 교차검증은 실행하지 않습니다.
-전체 train으로 한 모델을 학습하고 매 epoch 공식 valid 평균 Macro-F1이 가장 높은 가중치를 저장합니다.
-저장 폴더를 지정하지 않으면 `runs/single_seed42_<날짜와 시간>`을 자동 생성하므로 반복 실행해도
-기존 기록과 충돌하지 않습니다. 시작 로그의 `run:`에 표시된 경로에서 `model.py`와 `best_model.pt`를 사용하세요.
-`--run_dir`을 직접 지정하면 기존처럼 해당 폴더를 사용하며 덮어쓰기를 막습니다.
-이어 학습할 때는 `!python train.py --run_dir runs/실제_저장폴더 --resume`을 사용합니다.
-모델·학습 설정·평가 전처리는 이번 저장 경로 수정으로 변경하지 않았습니다.
+## Colab에서 세 파일 교체 후 실행
 
-## 먼저 기존 모델을 같은 valid에서 비교
-
-기존 Colab에서 학습을 종료한 상태로 세 파일만 교체합니다. 추가 Python 파일과 Drive 연결은 필요 없습니다.
-이전 run 폴더의 `model.py`와 `best_model.pt`는 보존하세요.
+현재 학습을 종료한 상태에서 다음 셀을 실행합니다. 추가 Python 파일이나 Drive 연결은 필요 없습니다.
+기존 실험의 model.py와 best_model.pt는 같은 한 쌍으로 보존하세요.
 
 ```python
 %cd /content/Class2026_DL/project1
@@ -32,118 +25,110 @@ for name, source in sources.items():
     print("교체 완료:", name)
 ```
 
-아래 명령은 두 run에 보관된 당시 모델 소스로 동일한 공식 valid를 평가합니다. 가중치는 수정하지 않습니다.
-경로가 다르면 실제 학습 폴더 이름으로 바꾸세요. 이전 가중치가 없으면 한 폴더만 지정해 오류 보고서를 얻을 수 있습니다.
+GPU 런타임인지 확인한 뒤 기존처럼 실행합니다.
 
 ```python
-!python train.py --compare_runs runs/deep_seed42 runs/refined_seed42 \
+import torch
+assert torch.cuda.is_available(), "런타임을 GPU로 변경하세요."
+!python train.py
+```
+
+기본값은 **160 epoch, batch 64, learning rate 0.001**입니다. 저장 폴더를 지정하지 않으면
+`runs/single_seed42_<날짜와 시간>`을 자동 생성하므로 반복 실행해도 기존 기록과 충돌하지 않습니다.
+시작 로그의 `run:`에 경로가 표시됩니다. 기존 best_model.pt가 프로젝트 폴더에 있어도 자동으로 불러오지 않습니다.
+매 epoch 첫 배치·25배치마다·마지막 배치의 진행 상황과 epoch 종료 후 valid F1을 출력합니다.
+
+SAM은 배치마다 두 번 순전파·역전파하므로 일반 AdamW보다 오래 걸립니다. 전체 GPU 실행 시간은
+측정하지 않았습니다. 첫 몇 epoch의 시간을 기준으로 남은 시간을 계산하세요.
+
+## 이번 모델과 학습 변경
+
+[model.py](project1/model.py)는 7개 Residual 블록의 CNN이며 출력 채널은 32→64→64→128→128→128→192입니다.
+
+| 방법 | 최신 실험에 적용한 내용과 목적 |
+|---|---|
+| 넓은 공간 특징 | 각 블록에 7×7 depthwise convolution과 BatchNorm, 작은 학습 가능 scale을 더해 넓은 영역을 처리 |
+| 채널 attention | SE 형태의 attention으로 채널별 중요도를 학습 |
+| 다중 스케일 | 16×16 중간 특징을 평균·최대 pooling하여 최종 8×8 특징과 결합 |
+| 분류 헤드 | 두 과제가 공통 CNN을 공유하고 각각 LayerNorm·Dropout과 독립 출력층 사용 |
+| 잎 보존 증강 | 큰 crop 없이 수평/수직 뒤집기, 90도 회전, 낮은 확률의 작은 affine 변화·blur 및 색상 변화 |
+| SAM | 반경 0.03의 첫 gradient 방향으로 가중치를 잠시 이동하고 그 위치의 gradient로 원래 가중치를 갱신 |
+| BatchNorm 처리 | SAM 두 번째 pass는 배치 통계를 사용하되 running mean/variance와 counter를 중복 갱신하지 않음 |
+| 불균형 대응 | train 빈도의 역수 거듭제곱을 정규화한 손실 가중치; 작물 α=0.5, 건강 α=0.35 |
+| 규제 | AdamW weight decay 0.0003, Dropout 0.2, stochastic depth 최대 0.03, label smoothing 0.02 |
+| MixUp | α=0.1, 확률 0.2로 작물·건강 라벨을 같은 순열과 비율로 혼합 |
+| 학습률 | 5 epoch warmup 후 cosine 감소, 최소 0.00001 |
+| 후반 정밀 학습 | 마지막 20%는 full-pixel flip/90도 회전, MixUp·smoothing·stochastic depth 해제, Dropout 0.1 |
+| 가중치 평균 | EMA와 후반 35%의 SWA; BN 재추정에는 깨끗한 train 이미지만 사용 |
+
+이 방법들은 개선을 위한 설계입니다. 전체 학습이나 동일 조건의 제거 실험을 하지 않은 상태에서
+각 기법의 향상 폭이나 private 데이터 성능을 주장하지 않습니다. AdamW의 가중치 감쇠는 적응형 optimizer의
+손실에 L2 항을 추가하는 방식과 동일하다고 표현하지 않습니다.
+
+매 epoch raw와 EMA의 공식 valid 평균 Macro-F1을 비교해 최고 모델을 저장합니다. 종료 후 best/last/EMA/SWA의
+train 기반 BN 재추정 후보를 평가하고 valid가 더 좋은 경우에만 저장합니다. 최종 제출은 **한 CNN의 state_dict**이며
+여러 모델의 예측을 동시에 실행하는 ensemble은 아닙니다. 이 선택 절차가 public 개선을 보장하지는 않습니다.
+
+## 평가와 제출 제한
+
+[dataset.py](project1/dataset.py)의 평가 전처리는 공식 **ToTensor + Normalize(mean=[0.5]*3, std=[0.5]*3)**를
+그대로 유지합니다. 평가 시 crop·회전·blur·TTA를 추가하지 않습니다.
+공식 [check_submission.py](project1/check_submission.py)는 변경하지 않았습니다.
+
+- 파라미터 **1,912,869개** + 실수형 버퍼 **5,312개** = **1,918,181개**로 2M 이내
+- FP32 plain state_dict 직렬화 확인: **7,741,981 bytes**, 약 **7.38 MiB**, 10MB 이내
+- 출력 (B,3), (B,2); 제출 모델은 torch와 표준 라이브러리만 사용
+- torchvision 및 그 의존성 Pillow로 학습 이미지를 읽음
+- 기존 첫 모델과 새 모델은 구조가 다르므로 당시 소스와 가중치를 같은 폴더의 한 쌍으로 사용
+
+학습 시작 로그의 실제 run 경로를 아래에 넣어 확인하세요.
+
+```python
+!python check_submission.py --model runs/실제_저장폴더/model.py \
+    --weights runs/실제_저장폴더/best_model.pt --data_dir student_data_128
+```
+
+필요하면 이전 모델과 같은 valid에서 클래스별 F1, confusion matrix, 오분류와 paired bootstrap 구간을 비교합니다.
+각 run에 저장된 당시 model.py로 평가하며 가중치를 변경하지 않습니다. 구간은 valid 표본의 불확실성만 반영합니다.
+
+```python
+!python train.py --compare_runs runs/이전_저장폴더 runs/새_저장폴더 \
     --run_dir runs/validation_audit
 ```
 
-`comparison.json`에는 클래스별 F1/confusion, 작물·건강 조합별 정확 개수, NLL과 오답의 평균 확신도를 저장합니다.
-모델별 `errors_*.csv`에는 오분류 이미지 ID와 라벨/예측을 저장합니다.
-첫 모델 대비 paired bootstrap 차이와 95% 구간도 계산합니다. 구간이 0을 포함하면 작은 valid 차이를 확실한 개선으로
-취급하지 마세요. 이 구간은 **valid 표본의 불확실성**이며 public/private 성능에 대한 보장이 아닙니다.
+코드만 최신으로 교체한 후 과거 가중치를 그대로 새 모델과 제출하지 마세요. 리더보드에 자동 제출하지 않습니다.
 
-## 선택 기능: train 내부 교차 검증 후 최종 모델 고정
-
-필요할 때만 `--cv`로 선택하는 절차입니다. 기본 단일 학습에는 적용되지 않습니다.
+## 재개·다운로드·보고서
 
 ```python
-!python train.py --cv --run_dir runs/generalize_cv
+!python train.py --run_dir runs/실제_저장폴더 --resume
 ```
 
-이 명령은 다음을 수행합니다.
+같은 코드와 설정으로 재개하며 이전 버전에서 시작한 run은 재개하지 않습니다. 원래 명령에 추가 옵션이 있었다면
+동일하게 전달하세요. `--run_dir`을 직접 지정한 새 학습은 폴더의 기존 기록을 덮어쓰지 않습니다.
+`/content`는 런타임 삭제 시 사라지므로 제출 파일과 기록을 다운로드해 보관합니다.
 
-1. **train만** 작물/건강 조합으로 층화해 3-fold를 만듭니다. RGB 픽셀이 완전히 같은 이미지들은 같은 fold에 묶습니다.
-2. 이전 deep 구조, 촬영 변화에 대응하는 증강, 현재 다중 스케일 구조의 **3개 사전 지정 설정 × 3-fold**를 비교합니다.
-   각 fold는 **처음부터 100 epoch** 학습합니다. 전체 train을 본 과거 가중치는 사용하지 않습니다.
-3. fold 평균과 표준편차를 보고, 최고 평균에서 1 standard error 이내라면 선언 순서에서 더 단순한 설정을 우선합니다.
-   각 fold도 마지막 EMA 또는 미리 지정한 SWA를 고정한 뒤 평가하며, held-out fold에서 최고 epoch를 계속 찾지 않습니다.
-4. 선택한 설정과 같은 epoch 예산(기본 100)으로 **전체 train을 처음부터 다시 학습**합니다.
-5. 최종 EMA/SWA 가중치를 먼저 저장·해시로 고정하고 **공식 valid는 마지막 평가에만** 사용합니다.
-   그 점수로 가중치·설정·epoch를 바꾸지 않습니다.
+- 제출: 해당 run의 **model.py + best_model.pt**
+- 보고서·재현: **model.py + train.py + dataset.py + config.json + best_metrics.json + history.json/CSV**
+- 재개: **last_checkpoint.pt**; 제출 파일이 아님
 
-평가 전처리는 공식 **ToTensor + Normalize(mean=0.5, std=0.5)** 그대로입니다. 평가 시 추가 이미지 증강을 하지 않습니다.
-`--cv_epochs`는 실험 전에 정하는 fold 학습 기간이고 `--epochs`는 최종 기간의 상한입니다.
-예를 들어 더 긴 예산을 시험하려면 시작 전에 `--cv_epochs 120 --epochs 120`을 함께 지정하고 다른 run 이름을 쓰세요.
-public 점수에 맞춰 예산을 반복 조정하지 않습니다.
+`--sam_rho 0`은 일반 AdamW와의 비교를 위한 옵션입니다. `--cv`, `--search`, `--fixed_epochs`는 기존 선택 기능으로
+남아 있으나 기본 실행에는 적용되지 않습니다. 사용자 요청의 새 실험은 `!python train.py` 한 번으로 진행합니다.
+`--init_weights`는 구조가 일치하는 자체 학습 가중치에만 허용되며 이번 실험에는 지정하지 않습니다.
 
-CSV의 촬영 개체/환경 정보는 제공되지 않으므로 이 분할이 새 촬영 환경에 대한 성능을 보증하지는 않습니다.
-전체 제공 데이터의 exact-pixel 검사에서는 중복 그룹 3개, train과 valid를 가로지르는 동일 이미지 0개를 확인했습니다.
-이는 근접 중복이나 촬영 개체의 중복을 전부 배제했다는 의미가 아닙니다.
-
-## 검사와 제출 전 검토
-
-```python
-!python check_submission.py --model runs/generalize_cv/model.py \
-    --weights runs/generalize_cv/best_model.pt --data_dir student_data_128
-```
-
-기존 최고 모델과의 공식 valid 비교도 확인합니다.
-
-```python
-!python train.py --compare_runs runs/deep_seed42 runs/generalize_cv \
-    --run_dir runs/final_validation_audit
-```
-
-`cv_results.json`의 fold 평균/분산, 클래스별 오분류, 기존 모델과의 valid 차이를 함께 보고 제출 여부를 결정하세요.
-명확한 개선 근거가 없으면 기존 모델을 보존하고 제출을 보류할 수 있습니다. 이 프로젝트는 리더보드에 자동 제출하지 않습니다.
-제출할 때는 **같은 run 폴더의 `model.py`와 `best_model.pt`**를 함께 사용합니다.
-
-```python
-import zipfile
-from google.colab import files
-with zipfile.ZipFile('/content/submission.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-    for name in ['model.py', 'best_model.pt']:
-        archive.write('runs/generalize_cv/' + name, arcname=name)
-files.download('/content/submission.zip')
-```
-
-## 재개와 저장 결과
-
-```python
-!python train.py --cv --run_dir runs/generalize_cv --resume
-```
-
-완료한 fold는 재학습하지 않고 재사용합니다. 소스·설정·fold 분할·train CSV가 바뀌면 재개를 거부합니다.
-같은 런타임에서 같은 설정으로 재개하세요. `/content`는 런타임이 삭제되면 사라지므로 체크포인트와 제출 파일을
-필요에 맞게 다운로드해야 합니다. `last_checkpoint.pt`는 재개용이며 제출 파일이 아닙니다.
-
-- `folds.json`: train 내부 이미지 ID·라벨·pixel hash·fold 지정
-- `cv_results.json`, `cv_selection.json`: 내부 검증 결과와 공식 valid 전에 고정한 선택
-- `<recipe>/fold0` 등: 각 fold의 소스·설정·history·재개용 체크포인트
-- `final_fit`: 전체 train으로 다시 학습한 기록과 가중치
-- 루트 `model.py`, `best_model.pt`, `evaluation.json`: 고정한 최종 모델과 공식 valid 보고
-- `frozen_selection.json`: 평가 전 weights SHA-256, 고정 기간/종류, valid의 선택 미사용 기록
-
-`--init_weights`는 일반 추가 학습에만 사용할 수 있습니다. **CV/fold/fixed refit에서는 금지**합니다.
-전체 train으로 학습한 가중치는 내부 held-out 이미지도 이미 보았기 때문입니다.
-`--search`는 동일 valid에서 여러 후보를 비교하는 선택 기능으로 남아 있습니다.
-`!python train.py`만 실행하면 종전 단일 학습이므로 새 절차에는 반드시 **`--cv`**를 붙이세요.
-
-## 모델·라이브러리 제한과 검증
-
-[model.py](project1/model.py)는 7개 Residual 블록, BatchNorm, SE attention, 평균/최대 pooling,
-두 LayerNorm/Dropout 헤드와 16×16 중간 특징 경로를 포함합니다. CV의 이전 deep 설정은 새 경로를 0으로 고정해
-같은 추론 함수를 사용합니다. 최종 제출은 한 모델이며 파라미터를 중복해서 숨기거나 여러 모델을 동시에 실행하지 않습니다.
-
-파라미터 **1,874,597개** + 실수형 버퍼 **3,840개** = **1,878,437개**, FP32 state_dict **약 7.22 MiB**로 제한 이내입니다.
-제출 모델은 torch와 표준 라이브러리만 사용합니다. 학습 데이터 로딩의 Pillow는 torchvision의 의존성입니다.
-데이터/가중치는 GitHub에 올리지 않습니다. 공식 [check_submission.py](project1/check_submission.py)는 변경하지 않았습니다.
+## 검증과 출처
 
 ```bash
-python -m unittest discover -s tests -v
 PLANT_DATA_DIR=/path/to/student_data_128 python -m unittest discover -s tests -v
 python scripts/build_colab.py
 ```
 
-테스트는 제출 규격·평가 전처리·과거 가중치 호환·MixUp/BN·실제 이미지 중단/재개 외에 다음도 검사합니다.
-동일 이미지의 fold 분리 금지, 공식 valid 파일 없는 내부 학습, 공식 valid 라벨 변경 시 고정 가중치의 완전 동일성,
-CV 선택/최종 단일 모델 내보내기, read-only 비교와 paired bootstrap입니다. 작은 CPU 학습 점수는 전체 성능이 아닙니다.
-CUDA AMP와 전체 성능은 Colab에서 확인해야 합니다.
-
+제출 규격·동일 평가 텐서·SAM perturb/restore·loss scaling·BN 통계·실제 이미지 학습·중단/재개를 확인합니다.
+CPU의 작은 학습 점수는 전체 모델 성능이 아닙니다. CUDA AMP와 전체 GPU 학습은 Colab에서 확인해야 합니다.
 [자동 준비 Colab](https://colab.research.google.com/github/yeonji200522-oss/DeepLearning2026-2/blob/main/colab_train.ipynb)는
-기존 단일 학습을 기본값으로 사용합니다. GPU 런타임에서 셀을 순서대로 실행하고 제출 전에 보고서를 검토하세요.
-Drive를 사용하지 않습니다. 데이터·과제 규격은 [Class2026_DL/project1](https://github.com/maygodwithu/Class2026_DL/tree/main/project1)에서 왔으며,
-자동 준비는 공식 커밋 `c0c7737fa2355cf57bf78792b376bf770aa950dd`를 고정합니다. 기존 `model_py.ipynb`는 보존했습니다.
+동일한 scratch 단일 학습을 기본값으로 사용합니다. Drive와 기존 가중치 업로드는 필요 없습니다.
+
+과제·데이터 출처는 [Class2026_DL/project1](https://github.com/maygodwithu/Class2026_DL/tree/main/project1)이며,
+자동 준비는 공식 커밋 `c0c7737fa2355cf57bf78792b376bf770aa950dd`를 사용합니다.
+첫 제출 보고서와 복구 코드의 기준은 과거 커밋 `9f23d1389feb6e224e0ba3bd86aba40ff99e4c3a`입니다.
+이번 새 실험은 별도 버전이며 첫 제출의 0.9739를 새 모델의 측정 결과로 표시하지 않습니다.

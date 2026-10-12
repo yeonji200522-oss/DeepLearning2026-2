@@ -1,6 +1,7 @@
 """Train from scratch, select by mean Macro-F1, and retain matching submission code."""
 import argparse
 import copy
+from contextlib import contextmanager
 import csv
 from datetime import datetime
 import hashlib
@@ -99,12 +100,14 @@ def configure_regularization(model, dropout, drop_path):
 
 
 def load_initial_weights(model, state):
-    """Accept only a matching model or the immediately preceding deep architecture."""
+    """Accept compatible own-data weights; never load an unrelated pretrained model."""
     allowed = {"detail_projection.weight"}
     expected = model.state_dict()
     missing, unexpected = expected.keys() - state.keys(), state.keys() - expected.keys()
-    if unexpected or missing - allowed:
-        raise ValueError("Starting weights do not match this deep model; use your own deep-run best_model.pt")
+    incompatible = any(expected[key].shape != state[key].shape for key in expected.keys() & state.keys())
+    if unexpected or missing - allowed or incompatible:
+        raise ValueError("Starting weights do not match this architecture. This version defaults to training "
+                         "from scratch; keep old weights with their saved model.py.")
     model.load_state_dict(state, strict=not missing)
     if missing:
         with torch.no_grad():
@@ -117,6 +120,57 @@ def mix_batch(images, targets, alpha):
     order = torch.randperm(len(images), device=images.device)
     return (images * fraction + images[order] * (1 - fraction),
             tuple(target[order] for target in targets), fraction)
+
+
+@torch.no_grad()
+def sam_perturb(model, rho, loss_scale=1.0):
+    """Perturb weights along the first gradient, accounting for AMP's loss scale."""
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    norms = [torch.linalg.vector_norm(p.grad.detach().float() / loss_scale) for p in parameters]
+    norm = torch.linalg.vector_norm(torch.stack(norms)) if norms else torch.tensor(0.0)
+    if not torch.isfinite(norm):
+        return None
+    scale = rho / (norm + 1e-12)
+    originals = []
+    for parameter in parameters:
+        originals.append((parameter, parameter.detach().clone()))
+        parameter.add_((parameter.grad.detach() / loss_scale) * scale.to(parameter))
+    return originals
+
+
+@torch.no_grad()
+def sam_restore(originals):
+    # Copy the original tensors to avoid roundoff from subtracting a perturbation.
+    for parameter, original in originals:
+        parameter.copy_(original)
+
+
+@contextmanager
+def suspend_bn_updates(model):
+    """Use batch statistics on SAM's second pass without updating running stats twice."""
+    modules = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
+    tracking = [m.track_running_stats for m in modules]
+    try:
+        for module in modules:
+            module.track_running_stats = False
+        yield
+    finally:
+        for module, enabled in zip(modules, tracking):
+            module.track_running_stats = enabled
+
+
+def batch_loss(model, images, crops, healths, criteria, args, mixed_targets, fraction, amp):
+    with torch.amp.autocast(device_type=images.device.type, enabled=amp):
+        crop, health = model(images)
+        loss = (args.crop_loss_weight * criteria[0](crop, crops)
+                + args.health_loss_weight * criteria[1](health, healths))
+        if mixed_targets is not None:
+            loss = (fraction * loss + (1 - fraction) * (
+                args.crop_loss_weight * criteria[0](crop, mixed_targets[0])
+                + args.health_loss_weight * criteria[1](health, mixed_targets[1])))
+    if not torch.isfinite(loss):
+        raise FloatingPointError("Non-finite training loss")
+    return loss
 
 
 @torch.no_grad()
@@ -201,7 +255,7 @@ def parse_args():
                         help="New runs default to a unique timestamped folder under runs/")
     parser.add_argument("--model", choices=("deep",), default="deep",
                         help="model.py contains the deep CNN; no separate model file is required")
-    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--epochs", type=int, default=160)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=None,
                         help="Defaults to 0.0002 with own starting weights, otherwise 0.001")
@@ -216,19 +270,24 @@ def parse_args():
                         help="Override class_weight_power for the health task only")
     parser.add_argument("--crop_loss_weight", type=float, default=1.25)
     parser.add_argument("--health_loss_weight", type=float, default=1.0)
-    parser.add_argument("--augmentation", choices=("standard", "gentle", "detail", "finish", "robust"),
-                        default="gentle")
+    parser.add_argument("--augmentation", choices=("standard", "gentle", "detail", "finish", "robust", "leaf"),
+                        default="leaf")
     parser.add_argument("--init_weights", default=None,
                         help="Start a NEW run from your own checkpoint trained only on the provided data")
     parser.add_argument("--label_smoothing", type=float, default=0.02)
     parser.add_argument("--ema_decay", type=float, default=0.99, help="0 disables EMA")
-    parser.add_argument("--mixup_alpha", type=float, default=0.15)
-    parser.add_argument("--mixup_prob", type=float, default=0.35)
+    parser.add_argument("--mixup_alpha", type=float, default=0.1)
+    parser.add_argument("--mixup_prob", type=float, default=0.2)
     parser.add_argument("--finish_fraction", type=float, default=0.2,
                         help="Last fraction uses pixel-preserving transforms and hard labels")
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--finish_dropout", type=float, default=0.1)
     parser.add_argument("--drop_path", type=float, default=0.03)
-    parser.add_argument("--swa_start", type=float, default=0.7,
+    parser.add_argument("--sam_rho", type=float, default=0.03,
+                        help="Sharpness-aware optimization radius; 0 uses ordinary AdamW")
+    parser.add_argument("--progress_every", type=int, default=25,
+                        help="Print batch progress at this interval; 0 prints epoch summaries only")
+    parser.add_argument("--swa_start", type=float, default=0.65,
                         help="Average late checkpoints within one run; 1 disables SWA")
     parser.add_argument("--no_bn_recalibration", action="store_true")
     parser.add_argument("--search", action="store_true",
@@ -297,8 +356,10 @@ def parse_args():
         parser.error("Require mixup_alpha >= 0 and mixup_prob in [0, 1]")
     if not 0 <= args.finish_fraction < 1 or not 0 <= args.swa_start <= 1:
         parser.error("Invalid finish_fraction or swa_start")
-    if not 0 <= args.dropout < 1 or not 0 <= args.drop_path < 1:
+    if not 0 <= args.dropout < 1 or not 0 <= args.drop_path < 1 or not 0 <= args.finish_dropout < 1:
         parser.error("Dropout and stochastic depth must be in [0, 1)")
+    if args.sam_rho < 0 or args.progress_every < 0:
+        parser.error("sam_rho and progress_every cannot be negative")
     if args.search and args.eval_only:
         parser.error("Evaluate a search result without --search")
     if sum((args.search, args.cv, bool(args.compare_runs))) > 1:
@@ -483,18 +544,20 @@ def main():
         print(f"Resuming epoch {first_epoch}; best score {best_score:.4f}")
 
     validation_count = len(valid_set) if valid_set is not None else "withheld until weights freeze"
-    print(f"Train {len(train_set)}; valid {validation_count}; AMP {amp}", flush=True)
+    print(f"Train {len(train_set)}; valid {validation_count}; AMP {amp}; SAM rho {args.sam_rho}", flush=True)
     for epoch in range(first_epoch, args.epochs + 1):
         start = time.perf_counter()
         finishing = args.finish_fraction > 0 and epoch > args.epochs * (1 - args.finish_fraction)
         profile = "finish" if finishing else args.augmentation
+        configure_regularization(model, args.finish_dropout if finishing else args.dropout,
+                                 0.0 if finishing else args.drop_path)
         train_dataset.transform = get_transforms(True, not args.no_augment, profile=profile)
         for criterion in criteria:
             criterion.label_smoothing = 0.0 if finishing else args.label_smoothing
         model.train()
         total_loss, seen, updates = 0.0, 0, 0
         learning_rate = optimizer.param_groups[0]["lr"]
-        for images, crops, healths in train_loader:
+        for batch_index, (images, crops, healths) in enumerate(train_loader, 1):
             images = images.to(device, non_blocking=True)
             crops, healths = crops.to(device, non_blocking=True), healths.to(device, non_blocking=True)
             mixed_targets, fraction = None, 1.0
@@ -502,17 +565,25 @@ def main():
                     and random.random() < args.mixup_prob):
                 images, mixed_targets, fraction = mix_batch(images, (crops, healths), args.mixup_alpha)
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=amp):
-                crop, health = model(images)
-                loss = (args.crop_loss_weight * criteria[0](crop, crops)
-                        + args.health_loss_weight * criteria[1](health, healths))
-                if mixed_targets is not None:
-                    loss = (fraction * loss + (1 - fraction) * (
-                        args.crop_loss_weight * criteria[0](crop, mixed_targets[0])
-                        + args.health_loss_weight * criteria[1](health, mixed_targets[1])))
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Non-finite training loss")
+            loss = batch_loss(model, images, crops, healths, criteria, args, mixed_targets, fraction, amp)
             scaler.scale(loss).backward()
+            if args.sam_rho:
+                originals = sam_perturb(model, args.sam_rho, scaler.get_scale())
+                if originals is None:
+                    if not amp:
+                        raise FloatingPointError("Non-finite SAM first-pass gradients")
+                    scaler.update(new_scale=scaler.get_scale() * 0.5)
+                    total_loss += loss.item() * len(images)
+                    seen += len(images)
+                    continue
+                optimizer.zero_grad(set_to_none=True)
+                try:
+                    with suspend_bn_updates(model):
+                        second_loss = batch_loss(model, images, crops, healths, criteria,
+                                                 args, mixed_targets, fraction, amp)
+                        scaler.scale(second_loss).backward()
+                finally:
+                    sam_restore(originals)
             scaler.unscale_(optimizer)
             gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             if not amp and not torch.isfinite(gradient_norm):
@@ -526,6 +597,10 @@ def main():
                     ema.update(model)
             total_loss += loss.item() * len(images)
             seen += len(images)
+            if args.progress_every and (batch_index == 1 or batch_index % args.progress_every == 0
+                                         or batch_index == len(train_loader)):
+                print(f"  epoch {epoch}/{args.epochs}; batch {batch_index}/{len(train_loader)}; "
+                      f"loss {total_loss / seen:.4f}; {time.perf_counter() - start:.1f}s", flush=True)
         if not updates:
             raise FloatingPointError("No optimizer updates completed")
         if args.swa_start < 1 and epoch > args.epochs * args.swa_start:
@@ -541,7 +616,9 @@ def main():
                   "seconds": time.perf_counter() - start, "optimizer_updates": updates,
                   "raw_score": raw_result["score"] if raw_result else None,
                   "ema_score": ema_result["score"] if ema_result else None,
-                  "selected": variant, "augmentation": profile, "swa_count": swa_count, **result}
+                  "selected": variant, "augmentation": profile, "swa_count": swa_count,
+                  "sam_rho": args.sam_rho, "dropout": args.finish_dropout if finishing else args.dropout,
+                  **result}
         history.append(record)
         metrics_text = ("valid withheld; fixed refit" if args.fixed_epochs else
                         f"crop F1 {result['crop_f1']:.4f} health F1 {result['health_f1']:.4f} "

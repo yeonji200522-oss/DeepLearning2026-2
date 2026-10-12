@@ -24,18 +24,19 @@ markdown("""
 이 노트북 안에 model.py / train.py / dataset.py가 포함되어 있으므로 파일을 따로 업로드하거나
 개인 GitHub에 push할 필요가 없습니다. 공식 저장소에서 데이터와 baseline을 자동으로 받습니다.
 
-더 깊은 Residual CNN + BatchNorm + SE attention + 두 출력 헤드의 Dropout,
-완만한 데이터 증강, AdamW weight decay, warmup/cosine 스케줄,
-train 라벨에만 근거한 클래스 가중치와 raw/EMA 검증 비교를 사용합니다.
+Residual CNN + 7×7 depthwise 공간 특징 + SE attention + 다중 스케일 pooling,
+BatchNorm·Dropout·AdamW weight decay, 잎 전체를 보존하는 증강,
+SAM 최적화, warmup/cosine, 클래스 가중치와 EMA·SWA를 사용합니다.
 사전학습 가중치는 사용하지 않습니다. 높은 점수는 전체 학습 후 검증으로 확인해야 합니다.
 
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-기본 실험은 전체 train으로 한 모델을 120 epoch 학습하고 매 epoch 공식 valid를 평가합니다.
+기본 실험은 전체 train으로 한 모델을 처음부터 160 epoch 학습하고 매 epoch 공식 valid를 평가합니다.
 valid 평균 Macro-F1이 가장 높은 단일 모델의 가중치를 저장합니다.
 교차검증은 기본값에서 실행하지 않습니다. RUN_CV=True로 선택할 수 있습니다.
-전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요. public 0.9820 도달은 보장하지 않습니다.
+SAM은 배치마다 두 번 순전파·역전파하므로 일반 AdamW보다 오래 걸립니다.
+전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요. public 0.9900 도달은 보장하지 않습니다.
 """)
 code("""
 import torch
@@ -61,7 +62,7 @@ CV_EPOCHS = 100
 RUN_SEARCH = False
 MODEL_VARIANT = 'deep'  # model.py에 포함된 확장 모델
 SEED = 42
-EPOCHS = 120
+EPOCHS = 160
 BATCH_SIZE = 64
 WEIGHT_DECAY = 3e-4
 CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
@@ -69,10 +70,9 @@ CROP_CLASS_WEIGHT_POWER = 0.5
 CROP_LOSS_WEIGHT = 1.25
 WARMUP_EPOCHS = 5
 LABEL_SMOOTHING = 0.02
-AUGMENTATION = 'gentle'         # 잎 형태를 더 보존하는 약한 증강; 기존 강도는 'standard'
-OWN_CHECKPOINTS = [Path('/content/Class2026_DL/project1/runs/deep_seed42/best_model.pt'),
-                   Path('/content/leaf-cnn/runs/deep_seed42/best_model.pt')]
-INIT_WEIGHTS = None  # 기본은 처음부터 학습; 추가 학습 시에만 직접 경로를 지정
+AUGMENTATION = 'leaf'           # 큰 crop 없이 잎 전체·병반 보존
+SAM_RHO = 0.03
+INIT_WEIGHTS = None  # 기존 best_model.pt 업로드 없이 처음부터 학습
 LEARNING_RATE = 2e-4 if INIT_WEIGHTS is not None else 1e-3
 RUN_BASELINE = False
 BASELINE_EPOCHS = 10
@@ -255,7 +255,8 @@ command = [sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
            '--lr', str(LEARNING_RATE), '--weight_decay', str(WEIGHT_DECAY),
            '--class_weight_power', str(CLASS_WEIGHT_POWER), '--crop_loss_weight', str(CROP_LOSS_WEIGHT),
            '--augmentation', AUGMENTATION, '--warmup_epochs', str(WARMUP_EPOCHS),
-           '--label_smoothing', str(LABEL_SMOOTHING), '--seed', str(SEED), '--device', 'cuda']
+           '--label_smoothing', str(LABEL_SMOOTHING), '--sam_rho', str(SAM_RHO),
+           '--seed', str(SEED), '--device', 'cuda']
 if CROP_CLASS_WEIGHT_POWER is not None:
     command.extend(['--crop_class_weight_power', str(CROP_CLASS_WEIGHT_POWER)])
 if INIT_WEIGHTS is not None:
@@ -323,7 +324,7 @@ markdown("""
 ## 이전 모델과 read-only 비교
 남아 있는 이전 모델과 동일 valid에서 오분류·과신 정도·paired bootstrap 구간을 확인합니다.
 구간은 valid 표본의 불확실성만 나타냅니다. public/private 성능을 보장하지 않습니다.
-CV 평균/분산, 클래스별 오류와 이 결과를 함께 검토한 뒤 제출하세요. 자동 제출하지 않습니다.
+클래스별 오류와 이 결과를 함께 검토한 뒤 제출하세요. 자동 제출하지 않습니다.
 """)
 code("""
 references = [path for path in REFERENCE_RUNS if (path / 'model.py').is_file()

@@ -26,6 +26,14 @@ class ResidualBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
+        # A cheap wide spatial branch complements local 3x3 features.
+        self.context = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 7, padding=3,
+                      groups=out_channels, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.context_scale = nn.Parameter(torch.full((1, out_channels, 1, 1), 1e-3))
         self.attention = ChannelAttention(out_channels)
         self.relu = nn.ReLU(inplace=True)
         # Training-only stochastic depth; no extra parameters or inference changes.
@@ -40,6 +48,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = self.shortcut(x)
         x = self.relu(self.bn1(self.conv1(x)))
+        x = x + self.context_scale * self.context(x)
         x = self.attention(self.bn2(self.conv2(x)))
         if self.training and self.drop_path:
             keep = 1 - self.drop_path
@@ -88,7 +97,8 @@ class MultiTaskCNN(nn.Module):
     def _initialize(self):
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                mode = "fan_in" if module.groups == module.in_channels else "fan_out"
+                nn.init.kaiming_normal_(module.weight, mode=mode, nonlinearity="relu")
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, (nn.BatchNorm2d, nn.LayerNorm)):
@@ -101,7 +111,7 @@ class MultiTaskCNN(nn.Module):
         for module in self.modules():
             if isinstance(module, ResidualBlock):
                 nn.init.zeros_(module.bn2.weight)
-        # A previous deep checkpoint starts with exactly the original inference function.
+        # Let the backbone learn first before the detail fusion grows from zero.
         nn.init.zeros_(self.detail_projection.weight)
 
     def forward(self, x):

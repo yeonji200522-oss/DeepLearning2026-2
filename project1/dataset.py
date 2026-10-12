@@ -97,8 +97,20 @@ def fold_indices(dataset, manifest_path, fold_index):
 def get_transforms(train, augment=True, profile="standard"):
     normalize = transforms.Normalize([0.5] * 3, [0.5] * 3)
     if train and augment:
-        if profile not in ("standard", "gentle", "detail", "finish", "robust"):
+        if profile not in ("standard", "gentle", "detail", "finish", "robust", "leaf"):
             raise ValueError(f"Unknown augmentation profile: {profile}")
+        if profile == "leaf":
+            # Retain the full leaf; perturb orientation and appearance without large crops.
+            return transforms.Compose([
+                transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip(),
+                transforms.RandomApply([transforms.RandomRotation((90, 90))], p=0.5),
+                transforms.RandomApply([transforms.RandomAffine(
+                    10, translate=(0.025, 0.025), scale=(0.97, 1.03),
+                    interpolation=InterpolationMode.BILINEAR, fill=(128, 128, 128))], p=0.3),
+                transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.08, hue=0.01),
+                transforms.RandomApply([transforms.GaussianBlur(3, sigma=(0.1, 0.5))], p=0.1),
+                transforms.ToTensor(), normalize,
+            ])
         if profile == "robust":
             return transforms.Compose([
                 transforms.RandomResizedCrop(128, scale=(0.9, 1.0), ratio=(0.9, 1.1),

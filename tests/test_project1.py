@@ -20,7 +20,7 @@ from model import MultiTaskCNN
 from dataset import get_transforms, PlantDataset, grouped_folds, fold_indices
 from train import (macro_f1, evaluate, load_initial_weights, mix_batch, average_states,
                    recalibrate_bn, configure_regularization)
-from train import paired_bootstrap
+from train import paired_bootstrap, sam_perturb, sam_restore, suspend_bn_updates
 
 spec = importlib.util.spec_from_file_location("official_checker", PROJECT / "check_submission.py")
 checker = importlib.util.module_from_spec(spec)
@@ -61,7 +61,7 @@ class SubmissionContractTests(unittest.TestCase):
         values = torch.arange(128 * 128 * 3).remainder(256).byte().numpy().tobytes()
         image = Image.frombytes("RGB", (128, 128), values)
         torch.testing.assert_close(get_transforms(False)(image), checker.EVAL_TRANSFORM(image), rtol=0, atol=0)
-        for profile in ("standard", "gentle", "detail", "finish", "robust"):
+        for profile in ("standard", "gentle", "detail", "finish", "robust", "leaf"):
             torch.testing.assert_close(get_transforms(False, profile=profile)(image),
                                        checker.EVAL_TRANSFORM(image), rtol=0, atol=0)
             for seed in range(5):
@@ -80,7 +80,7 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertAlmostEqual(score, (0.5 + 2 / 3 + 0) / 3, places=6)
         self.assertEqual(per_class[2], 0)
 
-    def test_previous_deep_weights_preserve_predictions_and_reject_incomplete_weights(self):
+    def test_compatible_weights_preserve_predictions_and_reject_incomplete_or_old_architecture(self):
         old = MultiTaskCNN().eval()
         state = {key: value for key, value in old.state_dict().items()
                  if key != "detail_projection.weight"}
@@ -88,7 +88,7 @@ class SubmissionContractTests(unittest.TestCase):
         load_initial_weights(restored, state)
         configure_regularization(restored, dropout=0.1, drop_path=0.2)
         images = torch.randn(2, 3, 128, 128)
-        # Reproduce the preceding deep architecture's inference, which had no detail branch.
+        # Check the same backbone without a detail branch.
         with torch.no_grad():
             x = old.features(old.stem(images))
             features = torch.cat((old.avg_pool(x).flatten(1), old.max_pool(x).flatten(1)), dim=1)
@@ -102,6 +102,61 @@ class SubmissionContractTests(unittest.TestCase):
         broken.pop("stem.0.weight")
         with self.assertRaises(ValueError):
             load_initial_weights(restored, broken)
+        historical = {key: value for key, value in state.items()
+                      if ".context." not in key and "context_scale" not in key}
+        with self.assertRaises(ValueError):
+            load_initial_weights(restored, historical)
+
+    def test_sam_gradient_scaling_restore_and_second_pass_bn_statistics(self):
+        model = torch.nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            model.weight.copy_(torch.tensor([[2.0, -1.0]]))
+        original = model.weight.detach().clone()
+        model.weight.grad = torch.tensor([[3.0, 4.0]]) * 128
+        saved = sam_perturb(model, 0.2, loss_scale=128)
+        torch.testing.assert_close(model.weight, original + torch.tensor([[0.12, 0.16]]))
+        torch.testing.assert_close((model.weight - original).norm(), torch.tensor(0.2))
+        sam_restore(saved)
+        torch.testing.assert_close(model.weight, original, rtol=0, atol=0)
+        model.weight.grad.fill_(float("inf"))
+        self.assertIsNone(sam_perturb(model, 0.2))
+        torch.testing.assert_close(model.weight, original, rtol=0, atol=0)
+
+        bn = torch.nn.BatchNorm2d(3).train()
+        images = torch.randn(4, 3, 8, 8)
+        bn(images)
+        state = {key: value.clone() for key, value in bn.state_dict().items()}
+        reference = bn(images)
+        bn.load_state_dict(state)
+        with self.assertRaisesRegex(RuntimeError, "simulated"):
+            with suspend_bn_updates(bn):
+                actual = bn(images)
+                torch.testing.assert_close(actual, reference)
+                raise RuntimeError("simulated")
+        self.assertTrue(bn.track_running_stats)
+        for key, value in state.items():
+            torch.testing.assert_close(bn.state_dict()[key], value, rtol=0, atol=0)
+
+    def test_sam_two_pass_update_with_grad_scaler(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        scaler = torch.amp.GradScaler("cpu", init_scale=128)
+        images = torch.ones(1, 1)
+        first = model(images).square().mean()
+        scaler.scale(first).backward()
+        originals = sam_perturb(model, 0.1, scaler.get_scale())
+        optimizer.zero_grad(set_to_none=True)
+        try:
+            scaler.scale(model(images).square().mean()).backward()
+        finally:
+            sam_restore(originals)
+        scaler.unscale_(optimizer)
+        scaler.step(optimizer)
+        scaler.update()
+        # Gradient at perturbed weight 1.1 is 2.2; apply it at original weight 1.0.
+        torch.testing.assert_close(model.weight, torch.tensor([[0.78]]))
 
     def test_mixup_pairs_both_labels_and_weight_average_preserves_integer_buffers(self):
         torch.manual_seed(17)
