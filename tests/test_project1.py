@@ -22,6 +22,7 @@ from train import (macro_f1, evaluate, load_initial_weights, mix_batch, average_
                    recalibrate_bn, configure_regularization)
 from train import paired_bootstrap, sam_perturb, sam_restore, suspend_bn_updates
 from train import find_resumable_run, run_lock, update_early_stop
+from train import update_adaptive_stage
 
 spec = importlib.util.spec_from_file_location("official_checker", PROJECT / "check_submission.py")
 checker = importlib.util.module_from_spec(spec)
@@ -90,6 +91,24 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertTrue(update_early_stop(state, 0.9011, True, 2, 0.0002))
         self.assertFalse(update_early_stop(state, 0.902, True, 2, 0.0002))
         self.assertEqual(state["bad_epochs"], 0)
+
+    def test_adaptive_schedule_lowers_lr_then_polishes_before_stopping(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(min_delta=0.0001, warmup_epochs=1, lr_patience=2,
+                               lr_factor=0.5, min_lr=0.0005, polish_min_epochs=3, patience=2)
+        state = {"phase": "learn", "lr": 0.001, "best": None, "bad_epochs": 0,
+                 "reductions": 0, "polish_epochs": 0}
+        self.assertIsNone(update_adaptive_stage(state, 0.9, 1, args))
+        self.assertIsNone(update_adaptive_stage(state, 0.9, 2, args))
+        self.assertEqual(update_adaptive_stage(state, 0.9, 3, args), "lower_lr")
+        self.assertEqual(state["lr"], 0.0005)
+        self.assertIsNone(update_adaptive_stage(state, 0.901, 4, args))
+        self.assertIsNone(update_adaptive_stage(state, 0.901, 5, args))
+        self.assertEqual(update_adaptive_stage(state, 0.901, 6, args), "start_polish")
+        self.assertIsNone(update_adaptive_stage(state, 0.901, 7, args))
+        self.assertIsNone(update_adaptive_stage(state, 0.901, 8, args))
+        self.assertEqual(update_adaptive_stage(state, 0.901, 9, args), "stop")
+        self.assertEqual(state["phase"], "done")
 
     def test_crop_spatial_route_changes_crop_without_changing_health(self):
         torch.manual_seed(23)
@@ -332,9 +351,9 @@ class TrainingIntegrationTests(unittest.TestCase):
             self.assertEqual(len(list((work / "runs").glob("single_*"))), 1)
             checkpoint = torch.load(run / "last_checkpoint.pt", weights_only=True)
             self.assertEqual([row["epoch"] for row in checkpoint["history"]], [1, 2, 3])
-            self.assertEqual(checkpoint["swa_count"], 0)
-            self.assertEqual(checkpoint["args"]["sam_rho"], 0)
-            self.assertIsNone(checkpoint["history"][0]["raw_score"])
+            self.assertGreater(checkpoint["swa_count"], 0)
+            self.assertEqual(checkpoint["args"]["sam_rho"], 0.03)
+            self.assertIsNotNone(checkpoint["history"][0]["raw_score"])
             self.assertTrue((run / "completed.json").is_file())
             self.assertIsNone(find_resumable_run(args, work, work / "runs"))
 
@@ -355,6 +374,57 @@ class TrainingIntegrationTests(unittest.TestCase):
             self.execute(options + ["--resume"])
             self.assertEqual(torch.load(run / "last_checkpoint.pt", weights_only=True)["epoch"], 6)
             after = torch.load(run / "best_model.pt", weights_only=True)
+            for key in before:
+                torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
+
+    def test_adaptive_polish_transition_and_disconnect_resume_match(self):
+        with tempfile.TemporaryDirectory(prefix="leaf-adaptive-") as temporary:
+            root = Path(temporary)
+            self.tiny_data(root / "data")
+            options = ["--data_dir", str(root / "data"), "--epochs", "0", "--schedule", "adaptive",
+                       "--batch_size", "8", "--num_workers", "0", "--device", "cpu",
+                       "--warmup_epochs", "0", "--lr", "0.001", "--min_lr", "0.0005",
+                       "--lr_patience", "1", "--polish_min_epochs", "2", "--patience", "1",
+                       "--no_bn_recalibration"]
+            # Synthetic plateau scores test the controller, not model accuracy; real images train the CNN.
+            wrapper = ("import train\n"
+                       "def plateau(*unused):\n"
+                       " return {'score':0.5,'crop_f1':0.5,'health_f1':0.5,"
+                       "'crop_f1_per_class':[0.5]*3,'health_f1_per_class':[0.5]*2,"
+                       "'crop_confusion':[[0]*3 for _ in range(3)],'health_confusion':[[0]*2 for _ in range(2)]}\n"
+                       "train.evaluate=plateau\n")
+            disconnect = ("original=train.atomic_save\n"
+                          "def interrupt(value,path):\n"
+                          " original(value,path)\n"
+                          " if path.name=='last_checkpoint.pt' and value['epoch']==3: raise SystemExit(75)\n"
+                          "train.atomic_save=interrupt\n")
+            runs = [root / "continuous", root / "resumed"]
+            def execute(run, pause=False, resume=False):
+                code = wrapper + (disconnect if pause else "") + "train.main()\n"
+                result = subprocess.run([sys.executable, "-c", code, *options, "--run_dir", str(run),
+                                         *(["--resume"] if resume else [])], cwd=PROJECT,
+                                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertEqual(result.returncode, 75 if pause else 0, result.stdout)
+            execute(runs[0])
+            execute(runs[1], pause=True)
+            halfway = torch.load(runs[1] / "last_checkpoint.pt", weights_only=True)
+            self.assertEqual(halfway["adaptive_state"]["phase"], "polish")
+            self.assertEqual(halfway["optimizer"]["state"], {})
+            execute(runs[1], resume=True)
+            records = [torch.load(run / "last_checkpoint.pt", weights_only=True) for run in runs]
+            for record in records:
+                self.assertEqual(record["epoch"], 5)
+                self.assertEqual(record["adaptive_state"]["phase"], "done")
+                self.assertTrue(record["early_stop"]["stopped"])
+                self.assertEqual(record["history"][2]["transition"], "start_polish")
+                self.assertEqual(record["history"][3]["augmentation"], "finish")
+                self.assertEqual(record["history"][3]["sam_rho"], 0.01)
+            for group in ("model", "ema"):
+                for key in records[0][group]:
+                    torch.testing.assert_close(records[0][group][key], records[1][group][key], rtol=0, atol=0)
+            before = torch.load(runs[1] / "best_model.pt", weights_only=True)
+            execute(runs[1], resume=True)
+            after = torch.load(runs[1] / "best_model.pt", weights_only=True)
             for key in before:
                 torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
 

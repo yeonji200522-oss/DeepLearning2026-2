@@ -27,18 +27,19 @@ markdown("""
 Residual CNN + 7×7 depthwise 공간 특징 + SE attention + 다중 스케일 pooling,
 작물 전용 2×2 공간 pooling 경로와 확장한 분류 헤드,
 BatchNorm·Dropout·AdamW weight decay, 잎 전체를 보존하는 증강,
-AdamW, warmup/cosine, 클래스 가중치와 EMA를 사용합니다.
+SAM·AdamW, validation plateau 학습률 조절, 클래스 가중치와 EMA·SWA를 사용합니다.
 사전학습 가중치는 사용하지 않습니다. 높은 점수는 전체 학습 후 검증으로 확인해야 합니다.
 
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-기본 실험은 전체 train으로 한 모델을 최대 120 epoch 학습합니다.
-EMA는 매 epoch 평가하고 raw는 5 epoch마다 평가합니다. 후반 정밀 학습에서 10 epoch 동안
-의미 있는 개선이 없으면 조기 종료합니다. 최고 가중치는 계속 저장합니다.
+기본 실험은 고정 epoch 상한 없이 valid 수렴까지 학습합니다. raw와 EMA는 매 epoch 평가합니다.
+10 epoch 정체 시 LR을 절반으로 낮추고 최소 LR에서도 정체하면 최고 모델로 되돌아가 정밀 학습합니다.
+정밀 학습을 최소 20 epoch 진행한 뒤에도 12 epoch 동안 의미 있는 개선이 없으면 종료합니다.
 valid 평균 Macro-F1이 가장 높은 단일 모델의 가중치를 저장합니다.
 교차검증은 기본값에서 실행하지 않습니다. RUN_CV=True로 선택할 수 있습니다.
-계산 비용을 줄이기 위해 SAM과 SWA는 기본값에서 끕니다. 종료 후 최고 모델만 BN 재추정합니다.
+SAM과 SWA를 다시 기본 실행에 포함하고 종료 후 여러 BN 재추정 후보를 valid로 비교합니다.
+시간을 줄이기 위한 조기 중단보다 성능을 우선합니다. 학습이 길어질 수 있으며 중단 후 재개를 지원합니다.
 전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요. public 0.9900 도달은 보장하지 않습니다.
 """)
 code("""
@@ -58,14 +59,14 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 """)
 code("""
 from pathlib import Path
-RUN_NAME = 'efficient_seed42'
+RUN_NAME = 'adaptive_seed42'
 RUN_CV = False
 CV_FOLDS = 3
 CV_EPOCHS = 100
 RUN_SEARCH = False
 MODEL_VARIANT = 'deep'  # model.py에 포함된 확장 모델
 SEED = 42
-EPOCHS = 120
+EPOCHS = 0  # 고정 상한 없이 adaptive 수렴; 양수 지정 시 cosine 예산 사용
 BATCH_SIZE = 64
 WEIGHT_DECAY = 3e-4
 CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
@@ -74,7 +75,7 @@ CROP_LOSS_WEIGHT = 1.5
 WARMUP_EPOCHS = 5
 LABEL_SMOOTHING = 0.02
 AUGMENTATION = 'leaf'           # 큰 crop 없이 잎 전체·병반 보존
-SAM_RHO = 0.0
+SAM_RHO = 0.03
 RUN_SMOKE = False  # 개발 시 선택; 기본 실행은 불필요한 추가 GPU 학습 생략
 INIT_WEIGHTS = None  # 기존 best_model.pt 업로드 없이 처음부터 학습
 LEARNING_RATE = 2e-4 if INIT_WEIGHTS is not None else 1e-3

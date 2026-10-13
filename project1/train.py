@@ -7,6 +7,7 @@ from datetime import datetime
 import errno
 import hashlib
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -327,6 +328,32 @@ def update_early_stop(state, score, active, patience, min_delta):
     return state["stopped"]
 
 
+def update_adaptive_stage(state, score, epoch, args):
+    """Lower LR on a plateau, then polish from the best weights before declaring convergence."""
+    improved = state["best"] is None or score > state["best"] + args.min_delta
+    if improved:
+        state["best"], state["bad_epochs"] = score, 0
+    else:
+        state["bad_epochs"] += 1
+    if state["phase"] == "learn":
+        if epoch <= args.warmup_epochs:
+            state["bad_epochs"] = 0
+        if state["bad_epochs"] >= args.lr_patience:
+            state["bad_epochs"] = 0
+            if state["lr"] > args.min_lr * (1 + 1e-8):
+                state["lr"] = max(args.min_lr, state["lr"] * args.lr_factor)
+                state["reductions"] += 1
+                return "lower_lr"
+            state["phase"], state["polish_epochs"] = "polish", 0
+            return "start_polish"
+    elif state["phase"] == "polish":
+        state["polish_epochs"] += 1
+        if state["polish_epochs"] >= args.polish_min_epochs and state["bad_epochs"] >= args.patience:
+            state["phase"] = "done"
+            return "stop"
+    return None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_dir", default="student_data_128")
@@ -334,7 +361,9 @@ def parse_args():
                         help="New runs default to a unique timestamped folder under runs/")
     parser.add_argument("--model", choices=("deep",), default="deep",
                         help="model.py contains the deep CNN; no separate model file is required")
-    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--epochs", type=int, default=0,
+                        help="0 lets adaptive training continue until validation convergence; positive selects a budget")
+    parser.add_argument("--schedule", choices=("adaptive", "cosine"), default=None)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=None,
                         help="Defaults to 0.0002 with own starting weights, otherwise 0.001")
@@ -362,20 +391,24 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--finish_dropout", type=float, default=0.1)
     parser.add_argument("--drop_path", type=float, default=0.03)
-    parser.add_argument("--sam_rho", type=float, default=0.0,
+    parser.add_argument("--sam_rho", type=float, default=0.03,
                         help="Sharpness-aware optimization radius; 0 uses ordinary AdamW")
+    parser.add_argument("--polish_sam_rho", type=float, default=0.01)
     parser.add_argument("--progress_every", type=int, default=25,
                         help="Print batch progress at this interval; 0 prints epoch summaries only")
-    parser.add_argument("--swa_start", type=float, default=1.0,
-                        help="Average late checkpoints within one run; 1 disables SWA")
+    parser.add_argument("--swa_start", type=float, default=0.65,
+                        help="Cosine: tail fraction; adaptive: average during polish; 1 disables SWA")
     parser.add_argument("--no_bn_recalibration", action="store_true")
-    parser.add_argument("--bn_candidates", choices=("best", "all"), default="best",
-                        help="Recalibrate only the retained best model by default")
-    parser.add_argument("--raw_eval_every", type=int, default=5,
+    parser.add_argument("--bn_candidates", choices=("best", "all"), default="all",
+                        help="Compare train-BN-recalibrated candidates by validation")
+    parser.add_argument("--raw_eval_every", type=int, default=1,
                         help="Evaluate EMA every epoch and raw every N epochs; 0 evaluates raw at the end only")
-    parser.add_argument("--patience", type=int, default=10,
+    parser.add_argument("--patience", type=int, default=12,
                         help="Stop after N plateau epochs, only during the final refinement phase; 0 disables")
-    parser.add_argument("--min_delta", type=float, default=0.0002)
+    parser.add_argument("--min_delta", type=float, default=0.0001)
+    parser.add_argument("--lr_patience", type=int, default=10)
+    parser.add_argument("--lr_factor", type=float, default=0.5)
+    parser.add_argument("--polish_min_epochs", type=int, default=20)
     parser.add_argument("--search", action="store_true",
                         help="Three training recipes then validation-gated single-model weight averaging")
     parser.add_argument("--search_seeds", type=int, nargs=3, default=[42, 43, 44])
@@ -408,6 +441,8 @@ def parse_args():
     parser.add_argument("--train_limit", type=int, default=0, help="Smoke checks only, 0 uses all data")
     parser.add_argument("--valid_limit", type=int, default=0, help="Smoke checks only, 0 uses all data")
     args = parser.parse_args()
+    if args.schedule is None:
+        args.schedule = "adaptive" if args.epochs == 0 else "cosine"
     args.data_dir = str(Path(args.data_dir).resolve())
     if args.init_weights:
         args.init_weights = str(Path(args.init_weights).resolve())
@@ -415,8 +450,14 @@ def parse_args():
         args.fold_manifest = str(Path(args.fold_manifest).resolve())
     if args.lr is None:
         args.lr = 2e-4 if args.init_weights else 1e-3
-    if args.epochs < 1 or args.batch_size < 2 or args.lr <= 0 or not 0 <= args.min_lr <= args.lr:
-        parser.error("Require epochs >= 1, batch_size >= 2 and 0 <= min_lr <= lr with lr > 0")
+    if args.epochs < 0 or args.batch_size < 2 or args.lr <= 0 or not 0 <= args.min_lr <= args.lr:
+        parser.error("Require epochs >= 0, batch_size >= 2 and 0 <= min_lr <= lr with lr > 0")
+    if args.schedule == "cosine" and args.epochs == 0:
+        parser.error("Cosine training needs a positive --epochs")
+    if args.schedule == "adaptive" and (args.patience < 1 or args.min_lr <= 0):
+        parser.error("Adaptive convergence needs patience >= 1 and min_lr > 0")
+    if args.lr_patience < 1 or args.polish_min_epochs < 1 or not 0 < args.lr_factor < 1:
+        parser.error("Require lr_patience/polish_min_epochs >= 1 and lr_factor in (0, 1)")
     if args.warmup_epochs < 0 or args.weight_decay < 0 or args.class_weight_power < 0:
         parser.error("Warmup, decay and class_weight_power cannot be negative")
     if any(power is not None and power < 0 for power in
@@ -434,7 +475,7 @@ def parse_args():
         parser.error("Invalid finish_fraction or swa_start")
     if not 0 <= args.dropout < 1 or not 0 <= args.drop_path < 1 or not 0 <= args.finish_dropout < 1:
         parser.error("Dropout and stochastic depth must be in [0, 1)")
-    if args.sam_rho < 0 or args.progress_every < 0:
+    if min(args.sam_rho, args.polish_sam_rho) < 0 or args.progress_every < 0:
         parser.error("sam_rho and progress_every cannot be negative")
     if min(args.raw_eval_every, args.patience) < 0 or args.min_delta < 0:
         parser.error("raw_eval_every, patience and min_delta cannot be negative")
@@ -442,6 +483,8 @@ def parse_args():
         parser.error("new_run cannot be combined with resume or eval_only")
     if args.search and args.eval_only:
         parser.error("Evaluate a search result without --search")
+    if args.search and args.epochs == 0:
+        parser.error("Recipe search needs a declared positive --epochs budget")
     if sum((args.search, args.cv, bool(args.compare_runs))) > 1:
         parser.error("Choose one of search, cv or compare_runs")
     if args.cv_folds < 2 or args.cv_epochs < 1 or args.bootstrap < 1:
@@ -452,6 +495,8 @@ def parse_args():
         parser.error("cv orchestrates its own folds and fixed refit")
     if args.fold_manifest and args.fold_index < 0:
         parser.error("fold_manifest needs a non-negative fold_index")
+    if (args.fixed_epochs or args.fold_manifest) and args.schedule != "cosine":
+        parser.error("Independent fixed refits use a positive epoch budget and cosine schedule")
     if args.fixed_epochs and args.fixed_variant == "swa" and (args.swa_start == 1 or args.no_bn_recalibration):
         parser.error("Fixed SWA requires late weight averaging and BN recalibration")
     if args.run_dir is None:
@@ -611,7 +656,8 @@ def train_one(args):
         {"params": decay, "weight_decay": args.weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ], lr=args.lr)
-    warmup = min(args.warmup_epochs, max(0, args.epochs - 1))
+    adaptive = args.schedule == "adaptive"
+    warmup = args.warmup_epochs if adaptive else min(args.warmup_epochs, max(0, args.epochs - 1))
 
     def lr_factor(epoch):
         if epoch < warmup:
@@ -620,7 +666,7 @@ def train_one(args):
         minimum = args.min_lr / args.lr
         return minimum + (1 - minimum) * (1 + math.cos(math.pi * progress)) / 2
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    scheduler = None if adaptive else torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
     amp = device.type == "cuda" and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay else None
@@ -628,6 +674,8 @@ def train_one(args):
     swa_state, swa_count = None, 0
     early_stop = {"best": initial_result["score"] if initial_result else None,
                   "bad_epochs": 0, "stopped": False}
+    adaptive_state = {"phase": "learn", "lr": args.lr, "best": early_stop["best"],
+                      "bad_epochs": 0, "reductions": 0, "polish_epochs": 0}
     if args.resume:
         saved = torch.load(last_path, map_location="cpu", weights_only=True)
         ignored = {"resume", "eval_only", "run_dir", "new_run", "device", "num_workers",
@@ -636,7 +684,8 @@ def train_one(args):
             raise ValueError("Resume requires the same training options, including total epochs")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
-        scheduler.load_state_dict(saved["scheduler"])
+        if scheduler:
+            scheduler.load_state_dict(saved["scheduler"])
         scaler.load_state_dict(saved["scaler"])
         if ema:
             ema.model.load_state_dict(saved["ema"])
@@ -644,8 +693,9 @@ def train_one(args):
         history, best_score = saved["history"], saved["best_score"]
         swa_state, swa_count = saved["swa_state"], saved["swa_count"]
         early_stop = saved.get("early_stop", early_stop)
+        adaptive_state = saved.get("adaptive_state", adaptive_state)
         first_epoch = saved["epoch"] + 1
-        if early_stop["stopped"]:
+        if early_stop["stopped"] and not adaptive:
             first_epoch = args.epochs + 1
         random.setstate(saved["random_state"])
         torch.set_rng_state(saved["torch_rng"])
@@ -656,9 +706,24 @@ def train_one(args):
 
     validation_count = len(valid_set) if valid_set is not None else "withheld until weights freeze"
     print(f"Train {len(train_set)}; valid {validation_count}; AMP {amp}; SAM rho {args.sam_rho}", flush=True)
-    for epoch in range(first_epoch, args.epochs + 1):
+    total_label = args.epochs or "adaptive"
+    print(f"Schedule: {args.schedule}; epoch budget: {total_label}", flush=True)
+    epochs = (itertools.count(first_epoch) if adaptive and not args.epochs
+              else range(first_epoch, args.epochs + 1))
+    if early_stop["stopped"]:
+        epochs = ()
+    for epoch in epochs:
         start = time.perf_counter()
-        finishing = args.finish_fraction > 0 and epoch > args.epochs * (1 - args.finish_fraction)
+        phase = adaptive_state["phase"] if adaptive else "cosine"
+        finishing = (phase == "polish" if adaptive else
+                     args.finish_fraction > 0 and epoch > args.epochs * (1 - args.finish_fraction))
+        effective_sam = (args.polish_sam_rho if adaptive and finishing and args.sam_rho else args.sam_rho)
+        if adaptive:
+            epoch_lr = adaptive_state["lr"]
+            if phase == "learn" and epoch <= warmup:
+                epoch_lr *= epoch / max(1, warmup)
+            for group in optimizer.param_groups:
+                group["lr"] = epoch_lr
         profile = "finish" if finishing else args.augmentation
         configure_regularization(model, args.finish_dropout if finishing else args.dropout,
                                  0.0 if finishing else args.drop_path)
@@ -678,8 +743,8 @@ def train_one(args):
             optimizer.zero_grad(set_to_none=True)
             loss = batch_loss(model, images, crops, healths, criteria, args, mixed_targets, fraction, amp)
             scaler.scale(loss).backward()
-            if args.sam_rho:
-                originals = sam_perturb(model, args.sam_rho, scaler.get_scale())
+            if effective_sam:
+                originals = sam_perturb(model, effective_sam, scaler.get_scale())
                 if originals is None:
                     if not amp:
                         raise FloatingPointError("Non-finite SAM first-pass gradients")
@@ -710,11 +775,13 @@ def train_one(args):
             seen += len(images)
             if args.progress_every and (batch_index == 1 or batch_index % args.progress_every == 0
                                          or batch_index == len(train_loader)):
-                print(f"  epoch {epoch}/{args.epochs}; batch {batch_index}/{len(train_loader)}; "
+                print(f"  epoch {epoch}/{total_label}; batch {batch_index}/{len(train_loader)}; "
                       f"loss {total_loss / seen:.4f}; {time.perf_counter() - start:.1f}s", flush=True)
         if not updates:
             raise FloatingPointError("No optimizer updates completed")
-        if args.swa_start < 1 and epoch > args.epochs * args.swa_start:
+        swa_due = (adaptive_state["polish_epochs"] >= 2 and finishing if adaptive
+                   else epoch > args.epochs * args.swa_start)
+        if args.swa_start < 1 and swa_due:
             current = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             swa_state = average_states(swa_state, current, swa_count) if swa_state else current
             swa_count += 1
@@ -730,22 +797,38 @@ def train_one(args):
                   "raw_score": raw_result["score"] if raw_result else None,
                   "ema_score": ema_result["score"] if ema_result else None,
                   "selected": variant, "augmentation": profile, "swa_count": swa_count,
-                  "sam_rho": args.sam_rho, "dropout": args.finish_dropout if finishing else args.dropout,
+                  "sam_rho": effective_sam, "phase": phase,
+                  "dropout": args.finish_dropout if finishing else args.dropout,
                   **result}
         history.append(record)
         metrics_text = ("valid withheld; fixed refit" if args.fixed_epochs else
                         f"crop F1 {result['crop_f1']:.4f} health F1 {result['health_f1']:.4f} "
                         f"score {result['score']:.4f} ({variant})")
-        print(f"[{epoch:02d}/{args.epochs}] loss {record['train_loss']:.4f} {metrics_text} "
+        print(f"[{epoch:02d}/{total_label}] loss {record['train_loss']:.4f} {metrics_text} "
               f"lr {learning_rate:.2g} {record['seconds']:.1f}s aug {profile}", flush=True)
         if not args.fixed_epochs and result["score"] > best_score:
             best_score = result["score"]
             save_candidate(selected, result, best_path, epoch, variant,
                            bool(args.train_limit or args.valid_limit))
             print(f"  Saved best_model.pt ({best_path.stat().st_size / 1024 ** 2:.2f} MiB)", flush=True)
-        should_stop = (update_early_stop(early_stop, result["score"], finishing,
-                                        args.patience, args.min_delta) if not args.fixed_epochs else False)
-        scheduler.step()
+        if adaptive:
+            transition = update_adaptive_stage(adaptive_state, result["score"], epoch, args)
+            should_stop = transition == "stop"
+            early_stop["stopped"] = should_stop
+            if transition:
+                record["transition"] = transition
+                print(f"Adaptive transition: {transition}; next LR {adaptive_state['lr']:.6g}", flush=True)
+            if transition == "start_polish":
+                model.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
+                optimizer.state.clear()
+                ema = ModelEMA(model, args.ema_decay) if args.ema_decay else None
+                swa_state, swa_count = None, 0
+                adaptive_state["best"] = best_score
+                record["polish_start_from_best"] = True
+        else:
+            should_stop = (update_early_stop(early_stop, result["score"], finishing,
+                                            args.patience, args.min_delta) if not args.fixed_epochs else False)
+            scheduler.step()
         write_json(history, run_dir / "history.json")
         with (run_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
             fields = ["epoch", "train_loss", "lr", "seconds", "crop_f1", "health_f1", "score",
@@ -755,17 +838,18 @@ def train_one(args):
             writer.writerows(history)
         atomic_save({
             "epoch": epoch, "args": vars(args), "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+            "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict() if scheduler else None,
             "scaler": scaler.state_dict(), "ema": ema.model.state_dict() if ema else None,
             "swa_state": swa_state, "swa_count": swa_count,
             "early_stop": early_stop,
+            "adaptive_state": adaptive_state,
             "ema_steps": ema.steps if ema else 0, "history": history, "best_score": best_score,
             "random_state": random.getstate(), "torch_rng": torch.get_rng_state(),
             "loader_rng": generator.get_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
         }, last_path)
         if should_stop:
-            print(f"Early stopping after epoch {epoch}: no significant improvement during "
+            print(f"{'Converged' if adaptive else 'Early stopping'} after epoch {epoch}: no significant improvement during "
                   f"{args.patience} final-phase epochs.", flush=True)
             break
     completed_epoch = history[-1]["epoch"]
@@ -1021,6 +1105,7 @@ def run_cv(args):
         for fold in range(args.cv_folds):
             child = root / recipe["name"] / f"fold{fold}"
             options = {**vars(args), **recipe["options"], "cv": False, "search": False,
+                       "schedule": "cosine",
                        "compare_runs": None, "fixed_epochs": True, "eval_only": False,
                        "run_dir": str(child), "fold_manifest": str(manifest_path), "fold_index": fold,
                        "seed": args.seed + fold, "epochs": args.cv_epochs,
@@ -1038,7 +1123,7 @@ def run_cv(args):
     chosen = next(row for row in summaries if row["mean"] >= winner["mean"] - winner["se"])
     median_epoch = statistics.median(row["epoch"] for row in chosen["folds"])
     # Keep the same per-image epoch budget rather than extending training after seeing valid.
-    final_epochs = max(1, min(args.epochs, round(median_epoch)))
+    final_epochs = max(1, min(args.epochs, round(median_epoch)) if args.epochs else round(median_epoch))
     decision = {"chosen_recipe": chosen["name"], "options": chosen["options"],
                 "mean_inner_f1": chosen["mean"], "std_inner_f1": chosen["std"],
                 "rule": "one_standard_error_in_declared_recipe_order", "refit_epochs": final_epochs,
@@ -1048,6 +1133,7 @@ def run_cv(args):
     print("\nFrozen train-only decision:", decision, flush=True)
     final = root / "final_fit"
     options = {**vars(args), **chosen["options"], "cv": False, "search": False, "compare_runs": None,
+               "schedule": "cosine",
                "fixed_epochs": True, "fold_manifest": None, "fold_index": -1, "epochs": final_epochs,
                "run_dir": str(final), "eval_only": False, "resume": (final / "last_checkpoint.pt").exists()}
     subprocess.run(cli_command(options, source_dir), cwd=source_dir, check=True)
