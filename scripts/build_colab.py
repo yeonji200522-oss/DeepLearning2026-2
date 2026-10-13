@@ -24,7 +24,7 @@ markdown("""
 이 노트북 안에 model.py / train.py / dataset.py가 포함되어 있으므로 파일을 따로 업로드하거나
 개인 GitHub에 push할 필요가 없습니다. 공식 저장소에서 데이터와 baseline을 자동으로 받습니다.
 
-Residual CNN + 7×7 depthwise 공간 특징 + SE attention + 다중 스케일 pooling,
+17개 MBConv 블록 + 3×3/5×5 depthwise 합성곱 + SE attention + 다중 스케일 pooling,
 작물 전용 2×2 공간 pooling 경로와 확장한 분류 헤드,
 BatchNorm·Dropout·AdamW weight decay, 잎 전체를 보존하는 증강,
 SAM·AdamW, validation plateau 학습률 조절, 클래스 가중치와 EMA·SWA를 사용합니다.
@@ -59,7 +59,7 @@ RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능�
 """)
 code("""
 from pathlib import Path
-RUN_NAME = 'adaptive_seed42'
+RUN_NAME = 'mbconv_seed42'
 RUN_CV = False
 CV_FOLDS = 3
 CV_EPOCHS = 100
@@ -250,7 +250,7 @@ if RUN_BASELINE:
 markdown("""
 ## 개선 모델 전체 학습
 기본 RUN_CV=False는 전체 train으로 한 모델을 학습하고 valid 최고 가중치를 저장합니다.
-RUN_CV=True이면 train 내부 3-fold에서 이전 deep·촬영 변화 증강·다중 스케일 설정을 비교합니다.
+RUN_CV=True이면 train 내부 3-fold에서 같은 MBConv 모델의 증강·다중 스케일 설정을 비교합니다.
 동일 픽셀 이미지는 한 fold에 묶고 작물/건강 조합을 층화합니다. 각 설정은 같은 fold에서
 정해진 기간으로 처음부터 학습합니다. 점수가 불확실하게 비슷하면 더 단순한 설정을 우선합니다.
 최종 설정과 학습 기간을 먼저 고정하고 전체 train으로 재학습하며 공식 valid는 마지막 보고에만 사용합니다.

@@ -16,7 +16,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT / "project1"
 sys.path.insert(0, str(PROJECT))
-from model import MultiTaskCNN
+from model import MultiTaskCNN, MBConv
 from dataset import get_transforms, PlantDataset, grouped_folds, fold_indices
 from train import (macro_f1, evaluate, load_initial_weights, mix_batch, average_states,
                    recalibrate_bn, configure_regularization)
@@ -110,6 +110,27 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertEqual(update_adaptive_stage(state, 0.901, 9, args), "stop")
         self.assertEqual(state["phase"], "done")
 
+    def test_mbconv_backbone_receives_finite_gradients_from_both_tasks(self):
+        torch.manual_seed(23)
+        model = MultiTaskCNN().train()
+        configure_regularization(model, dropout=0.2, drop_path=0.03)
+        crop, health = model(torch.randn(2, 3, 128, 128))
+        loss = (torch.nn.functional.cross_entropy(crop, torch.tensor([0, 2])) +
+                torch.nn.functional.cross_entropy(health, torch.tensor([0, 1])))
+        loss.backward()
+        # Catch detached branches, unstable deep activations and disconnected heads.
+        for block in model.features:
+            if isinstance(block, MBConv):
+                for weight in (block.depthwise[0].weight, block.project[0].weight,
+                               block.attention.layers[1].weight):
+                    self.assertIsNotNone(weight.grad)
+                    self.assertTrue(torch.isfinite(weight.grad).all())
+                    self.assertGreater(weight.grad.abs().sum().item(), 0)
+        for layer in (model.crop_head, model.health_head, model.detail_projection,
+                      model.crop_layout[-1]):
+            self.assertTrue(torch.isfinite(layer.weight.grad).all())
+            self.assertGreater(layer.weight.grad.abs().sum().item(), 0)
+
     def test_crop_spatial_route_changes_crop_without_changing_health(self):
         torch.manual_seed(23)
         model = MultiTaskCNN().eval()
@@ -146,8 +167,9 @@ class SubmissionContractTests(unittest.TestCase):
         broken.pop("stem.0.weight")
         with self.assertRaises(ValueError):
             load_initial_weights(restored, broken)
-        historical = {key: value for key, value in state.items()
-                      if ".context." not in key and "context_scale" not in key}
+        historical = dict(state)
+        # The previous residual architecture used a 32-channel stem, not 24.
+        historical["stem.0.weight"] = torch.randn(32, 3, 3, 3)
         with self.assertRaises(ValueError):
             load_initial_weights(restored, historical)
 

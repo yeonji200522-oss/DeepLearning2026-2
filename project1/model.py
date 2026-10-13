@@ -1,16 +1,15 @@
-"""Deeper residual CNN trained from scratch; standalone torch-only submission code."""
+"""MBConv CNN trained from scratch; standalone torch-only submission code."""
 import torch
 from torch import nn
 
 
 class ChannelAttention(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, hidden):
         super().__init__()
-        hidden = max(8, channels // 8)
         self.layers = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(channels, hidden, 1),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(hidden, channels, 1),
             nn.Sigmoid(),
         )
@@ -19,88 +18,93 @@ class ChannelAttention(nn.Module):
         return x * self.layers(x)
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+def conv_norm_act(in_channels, out_channels, kernel=1, stride=1, groups=1):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel, stride, kernel // 2,
+                  groups=groups, bias=False),
+        nn.BatchNorm2d(out_channels),
+        nn.SiLU(inplace=True),
+    )
+
+
+class MBConv(nn.Module):
+    """Expand channels, filter spatially, attend, then project to a narrow output."""
+    def __init__(self, in_channels, out_channels, stride=1, kernel=3, expansion=4):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        # A cheap wide spatial branch complements local 3x3 features.
-        self.context = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 7, padding=3,
-                      groups=out_channels, bias=False),
+        expanded = in_channels * expansion
+        self.expand = (conv_norm_act(in_channels, expanded)
+                       if expansion != 1 else nn.Identity())
+        self.depthwise = conv_norm_act(expanded, expanded, kernel, stride, expanded)
+        # Squeeze relative to input width, not the expanded width, to keep SE small.
+        self.attention = ChannelAttention(expanded, max(4, in_channels // 4))
+        self.project = nn.Sequential(
+            nn.Conv2d(expanded, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
         )
-        self.context_scale = nn.Parameter(torch.full((1, out_channels, 1, 1), 1e-3))
-        self.attention = ChannelAttention(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        # Training-only stochastic depth; no extra parameters or inference changes.
+        self.use_residual = stride == 1 and in_channels == out_channels
         self.drop_path = 0.0
-        self.shortcut = nn.Identity()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
 
     def forward(self, x):
-        residual = self.shortcut(x)
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = x + self.context_scale * self.context(x)
-        x = self.attention(self.bn2(self.conv2(x)))
-        if self.training and self.drop_path:
-            keep = 1 - self.drop_path
-            mask = (torch.rand((x.shape[0], 1, 1, 1), device=x.device) < keep).to(x.dtype)
-            x = x * mask / keep
-        return self.relu(x + residual)
+        output = self.project(self.attention(self.depthwise(self.expand(x))))
+        if self.use_residual:
+            if self.training and self.drop_path:
+                keep = 1 - self.drop_path
+                mask = (torch.rand((x.shape[0], 1, 1, 1), device=x.device) < keep).to(x.dtype)
+                output = output * mask / keep
+            output = x + output
+        return output
 
 
 class MultiTaskCNN(nn.Module):
     def __init__(self, num_crops=3, num_health=2):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
+        self.stem = conv_norm_act(3, 24, kernel=3)
+        # (output channels, repeats, first stride, spatial kernel, expansion).
+        # Retain 16x16 leaf/lesion features for nine blocks before the last reduction.
+        stages = (
+            (16, 1, 1, 3, 1),
+            (24, 2, 2, 3, 4),
+            (40, 3, 2, 5, 4),
+            (64, 5, 2, 5, 6),
+            (96, 4, 1, 5, 6),
+            (160, 2, 2, 5, 6),
         )
-        # Extra 32x32 and 16x16 blocks preserve spatial detail before downsampling.
-        self.features = nn.Sequential(
-            ResidualBlock(32, 32, 2),
-            ResidualBlock(32, 64, 2),
-            ResidualBlock(64, 64),
-            ResidualBlock(64, 128, 2),
-            ResidualBlock(128, 128),
-            ResidualBlock(128, 128),
-            ResidualBlock(128, 192, 2),
-        )
+        blocks = []
+        channels = 24
+        for out_channels, repeats, stride, kernel, expansion in stages:
+            for repeat in range(repeats):
+                blocks.append(MBConv(channels, out_channels,
+                                     stride if repeat == 0 else 1, kernel, expansion))
+                channels = out_channels
+            if out_channels == 96:
+                self.detail_index = len(blocks) - 1
+        blocks.append(conv_norm_act(channels, 192))
+        self.features = nn.Sequential(*blocks)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
-        # Fuse 16x16 detail features with 8x8 semantic features without enlarging the backbone.
-        self.detail_projection = nn.Linear(256, 384, bias=False)
-        # Preserve coarse spatial layout for crop identification rather than pooling it all away.
+        # Fuse 16x16 detail and 8x8 semantic features, with a crop-only spatial route.
+        self.detail_projection = nn.Linear(192, 384, bias=False)
         self.crop_layout = nn.Sequential(
             nn.AdaptiveAvgPool2d((2, 2)),
             nn.Flatten(),
-            nn.Linear(512, 64, bias=False),
+            nn.Linear(384, 64, bias=False),
             nn.LayerNorm(64),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(64, 320, bias=False),
         )
         self.crop_features = self._head_features(320)
-        self.health_features = self._head_features()
+        self.health_features = self._head_features(256)
         self.crop_head = nn.Linear(320, num_crops)
         self.health_head = nn.Linear(256, num_health)
         self._initialize()
 
     @staticmethod
-    def _head_features(width=256):
+    def _head_features(width):
         return nn.Sequential(
             nn.Linear(384, width),
             nn.LayerNorm(width),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout(0.2),
         )
 
@@ -118,19 +122,14 @@ class MultiTaskCNN(nn.Module):
                 nn.init.normal_(module.weight, std=0.01)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        for module in self.modules():
-            if isinstance(module, ResidualBlock):
-                nn.init.zeros_(module.bn2.weight)
-        # Let the backbone learn first before the detail fusion grows from zero.
         nn.init.zeros_(self.detail_projection.weight)
-        # Start the extra crop route at zero so it can learn gradually.
         nn.init.zeros_(self.crop_layout[-1].weight)
 
     def forward(self, x):
         x = self.stem(x)
         for index, block in enumerate(self.features):
             x = block(x)
-            if index == len(self.features) - 2:
+            if index == self.detail_index:
                 detail_map = x
                 detail = torch.cat((self.avg_pool(x).flatten(1), self.max_pool(x).flatten(1)), dim=1)
         features = torch.cat((self.avg_pool(x).flatten(1), self.max_pool(x).flatten(1)), dim=1)
