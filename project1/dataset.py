@@ -108,7 +108,6 @@ def get_transforms(train, augment=True, profile="standard"):
                     10, translate=(0.025, 0.025), scale=(0.97, 1.03),
                     interpolation=InterpolationMode.BILINEAR, fill=(128, 128, 128))], p=0.3),
                 transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.08, hue=0.01),
-                transforms.RandomApply([transforms.GaussianBlur(3, sigma=(0.1, 0.5))], p=0.1),
                 transforms.ToTensor(), normalize,
             ])
         if profile == "robust":

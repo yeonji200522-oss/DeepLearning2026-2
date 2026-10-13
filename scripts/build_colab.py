@@ -27,16 +27,18 @@ markdown("""
 Residual CNN + 7×7 depthwise 공간 특징 + SE attention + 다중 스케일 pooling,
 작물 전용 2×2 공간 pooling 경로와 확장한 분류 헤드,
 BatchNorm·Dropout·AdamW weight decay, 잎 전체를 보존하는 증강,
-SAM 최적화, warmup/cosine, 클래스 가중치와 EMA·SWA를 사용합니다.
+AdamW, warmup/cosine, 클래스 가중치와 EMA를 사용합니다.
 사전학습 가중치는 사용하지 않습니다. 높은 점수는 전체 학습 후 검증으로 확인해야 합니다.
 
 학습은 Colab GPU에서 실행하며 가중치·코드·로그는 `/content/leaf-cnn/runs`에 저장합니다.
 Drive 연결은 필요 없습니다. 같은 런타임에서는 같은 설정과 RUN_NAME으로 재개할 수 있습니다.
 런타임이 삭제되면 파일도 사라지므로 종료 전에 제출 ZIP과 필요한 실험 기록을 다운로드하세요.
-기본 실험은 전체 train으로 한 모델을 처음부터 200 epoch 학습하고 매 epoch 공식 valid를 평가합니다.
+기본 실험은 전체 train으로 한 모델을 최대 120 epoch 학습합니다.
+EMA는 매 epoch 평가하고 raw는 5 epoch마다 평가합니다. 후반 정밀 학습에서 10 epoch 동안
+의미 있는 개선이 없으면 조기 종료합니다. 최고 가중치는 계속 저장합니다.
 valid 평균 Macro-F1이 가장 높은 단일 모델의 가중치를 저장합니다.
 교차검증은 기본값에서 실행하지 않습니다. RUN_CV=True로 선택할 수 있습니다.
-SAM은 배치마다 두 번 순전파·역전파하므로 일반 AdamW보다 오래 걸립니다.
+계산 비용을 줄이기 위해 SAM과 SWA는 기본값에서 끕니다. 종료 후 최고 모델만 BN 재추정합니다.
 전체 GPU 학습 시간과 성능은 실행 후 로그로 확인하세요. public 0.9900 도달은 보장하지 않습니다.
 """)
 code("""
@@ -49,21 +51,21 @@ print('VRAM GiB:', round(torch.cuda.get_device_properties(0).total_memory / 1024
 """)
 markdown("""
 ## 실행 설정
-처음에는 아래 기본값으로 시작하세요. 비교 실험은 RUN_NAME을 새 이름으로 바꾸고 진행합니다.
+처음에는 아래 기본값으로 시작하세요. 고정 RUN_NAME으로 같은 런타임에서 중단된 학습을 재개합니다.
+새 비교 실험은 RUN_NAME을 새 이름으로 바꾸고 진행합니다.
 재개할 때는 학습 설정과 총 EPOCHS를 그대로 유지해야 합니다.
 RUN_BASELINE=False는 공식 baseline 비교를 생략합니다. 검증 성능을 비교하려면 True를 사용하세요.
 """)
 code("""
 from pathlib import Path
-from datetime import datetime
-RUN_NAME = 'single_seed42_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+RUN_NAME = 'efficient_seed42'
 RUN_CV = False
 CV_FOLDS = 3
 CV_EPOCHS = 100
 RUN_SEARCH = False
 MODEL_VARIANT = 'deep'  # model.py에 포함된 확장 모델
 SEED = 42
-EPOCHS = 200
+EPOCHS = 120
 BATCH_SIZE = 64
 WEIGHT_DECAY = 3e-4
 CLASS_WEIGHT_POWER = 0.35  # 0이면 클래스 가중치 해제
@@ -72,7 +74,8 @@ CROP_LOSS_WEIGHT = 1.5
 WARMUP_EPOCHS = 5
 LABEL_SMOOTHING = 0.02
 AUGMENTATION = 'leaf'           # 큰 crop 없이 잎 전체·병반 보존
-SAM_RHO = 0.03
+SAM_RHO = 0.0
+RUN_SMOKE = False  # 개발 시 선택; 기본 실행은 불필요한 추가 GPU 학습 생략
 INIT_WEIGHTS = None  # 기존 best_model.pt 업로드 없이 처음부터 학습
 LEARNING_RATE = 2e-4 if INIT_WEIGHTS is not None else 1e-3
 RUN_BASELINE = False
@@ -201,12 +204,15 @@ def run_logged(command, cwd, log_path):
     if status:
         raise subprocess.CalledProcessError(status, command)
 
-smoke_dir = Path(tempfile.mkdtemp(prefix='leaf-smoke-', dir='/content'))
-run_logged([sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
-            '--run_dir', str(smoke_dir), '--model', MODEL_VARIANT, '--epochs', '1', '--batch_size', '8',
-            '--train_limit', '32', '--valid_limit', '32', '--device', 'cuda'],
-           WORK, smoke_dir / 'console.log')
-assert json.loads((smoke_dir / 'best_metrics.json').read_text())['smoke_run']
+if RUN_SMOKE:
+    smoke_dir = Path(tempfile.mkdtemp(prefix='leaf-smoke-', dir='/content'))
+    run_logged([sys.executable, '-u', 'train.py', '--data_dir', str(DATA_DIR),
+                '--run_dir', str(smoke_dir), '--model', MODEL_VARIANT, '--epochs', '1', '--batch_size', '8',
+                '--train_limit', '32', '--valid_limit', '32', '--device', 'cuda'],
+               WORK, smoke_dir / 'console.log')
+    assert json.loads((smoke_dir / 'best_metrics.json').read_text())['smoke_run']
+else:
+    print('추가 GPU smoke 학습 생략')
 """)
 markdown("""
 ## 공식 baseline 학습 (기본 설정 10 epoch)

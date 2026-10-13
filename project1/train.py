@@ -4,6 +4,7 @@ import copy
 from contextlib import contextmanager
 import csv
 from datetime import datetime
+import errno
 import hashlib
 import importlib.util
 import json
@@ -36,6 +37,43 @@ def write_json(value, path):
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
+
+
+@contextmanager
+def run_lock(directory):
+    """OS locks are released when a killed process exits; reconnecting cannot duplicate it."""
+    path = Path(directory) / ".run.lock"
+    handle = path.open("a+b")
+    locked = False
+    try:
+        if not path.stat().st_size:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                raise RuntimeError(f"Training is already running in {directory}; reconnect to its output "
+                                   "or stop that process before restarting.") from error
+            raise
+        locked = True
+        yield
+    finally:
+        if locked:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def seed_worker(worker_id):
@@ -248,6 +286,47 @@ class ModelEMA:
             averaged.copy_(current)
 
 
+def find_resumable_run(args, source_dir=None, run_root=None):
+    """Find the most recent unfinished single run with exactly matching code and settings."""
+    source_dir = source_dir or Path(__file__).resolve().parent
+    run_root = run_root or Path("runs")
+    hashes = {name: hashlib.sha256((source_dir / name).read_bytes()).hexdigest()
+              for name in ("model.py", "dataset.py", "train.py")}
+    ignored = {"run_dir", "resume", "eval_only", "new_run", "device", "num_workers",
+               "num_threads", "progress_every"}
+    compatible = []
+    for directory in run_root.glob("single_seed*_*"):
+        checkpoint = directory / "last_checkpoint.pt"
+        if (directory / "completed.json").exists():
+            continue
+        try:
+            config = json.loads((directory / "config.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if config.get("source_sha256") == hashes and all(
+            config.get("args", {}).get(key) == value
+            for key, value in vars(args).items() if key not in ignored
+        ):
+            if (directory / ".run.lock").exists():
+                with run_lock(directory):
+                    pass
+            if checkpoint.is_file():
+                compatible.append(directory)
+    return max(compatible, key=lambda path: (path / "last_checkpoint.pt").stat().st_mtime) if compatible else None
+
+
+def update_early_stop(state, score, active, patience, min_delta):
+    improved = state["best"] is None or score > state["best"] + min_delta
+    if improved:
+        state["best"], state["bad_epochs"] = score, 0
+    elif active:
+        state["bad_epochs"] += 1
+    if not active:
+        state["bad_epochs"] = 0
+    state["stopped"] = bool(active and patience and state["bad_epochs"] >= patience)
+    return state["stopped"]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_dir", default="student_data_128")
@@ -255,7 +334,7 @@ def parse_args():
                         help="New runs default to a unique timestamped folder under runs/")
     parser.add_argument("--model", choices=("deep",), default="deep",
                         help="model.py contains the deep CNN; no separate model file is required")
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=None,
                         help="Defaults to 0.0002 with own starting weights, otherwise 0.001")
@@ -283,13 +362,20 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--finish_dropout", type=float, default=0.1)
     parser.add_argument("--drop_path", type=float, default=0.03)
-    parser.add_argument("--sam_rho", type=float, default=0.03,
+    parser.add_argument("--sam_rho", type=float, default=0.0,
                         help="Sharpness-aware optimization radius; 0 uses ordinary AdamW")
     parser.add_argument("--progress_every", type=int, default=25,
                         help="Print batch progress at this interval; 0 prints epoch summaries only")
-    parser.add_argument("--swa_start", type=float, default=0.65,
+    parser.add_argument("--swa_start", type=float, default=1.0,
                         help="Average late checkpoints within one run; 1 disables SWA")
     parser.add_argument("--no_bn_recalibration", action="store_true")
+    parser.add_argument("--bn_candidates", choices=("best", "all"), default="best",
+                        help="Recalibrate only the retained best model by default")
+    parser.add_argument("--raw_eval_every", type=int, default=5,
+                        help="Evaluate EMA every epoch and raw every N epochs; 0 evaluates raw at the end only")
+    parser.add_argument("--patience", type=int, default=10,
+                        help="Stop after N plateau epochs, only during the final refinement phase; 0 disables")
+    parser.add_argument("--min_delta", type=float, default=0.0002)
     parser.add_argument("--search", action="store_true",
                         help="Three training recipes then validation-gated single-model weight averaging")
     parser.add_argument("--search_seeds", type=int, nargs=3, default=[42, 43, 44])
@@ -316,22 +402,12 @@ def parse_args():
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_augment", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--new_run", action="store_true",
+                        help="Start fresh instead of auto-resuming a compatible unfinished default run")
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--train_limit", type=int, default=0, help="Smoke checks only, 0 uses all data")
     parser.add_argument("--valid_limit", type=int, default=0, help="Smoke checks only, 0 uses all data")
     args = parser.parse_args()
-    if args.run_dir is None:
-        if args.resume or args.eval_only:
-            # Preserve the legacy default; timestamped runs should specify their saved path.
-            args.run_dir = "runs/refined_seed42"
-        else:
-            mode = "cv" if args.cv else "search" if args.search else "audit" if args.compare_runs else "single"
-            base = Path("runs") / f"{mode}_seed{args.seed}_{datetime.now():%Y%m%d_%H%M%S_%f}"
-            selected, suffix = base, 1
-            while selected.exists():
-                selected = base.with_name(f"{base.name}_{suffix}")
-                suffix += 1
-            args.run_dir = str(selected)
     args.data_dir = str(Path(args.data_dir).resolve())
     if args.init_weights:
         args.init_weights = str(Path(args.init_weights).resolve())
@@ -360,6 +436,10 @@ def parse_args():
         parser.error("Dropout and stochastic depth must be in [0, 1)")
     if args.sam_rho < 0 or args.progress_every < 0:
         parser.error("sam_rho and progress_every cannot be negative")
+    if min(args.raw_eval_every, args.patience) < 0 or args.min_delta < 0:
+        parser.error("raw_eval_every, patience and min_delta cannot be negative")
+    if args.new_run and (args.resume or args.eval_only):
+        parser.error("new_run cannot be combined with resume or eval_only")
     if args.search and args.eval_only:
         parser.error("Evaluate a search result without --search")
     if sum((args.search, args.cv, bool(args.compare_runs))) > 1:
@@ -374,6 +454,24 @@ def parse_args():
         parser.error("fold_manifest needs a non-negative fold_index")
     if args.fixed_epochs and args.fixed_variant == "swa" and (args.swa_start == 1 or args.no_bn_recalibration):
         parser.error("Fixed SWA requires late weight averaging and BN recalibration")
+    if args.run_dir is None:
+        if args.eval_only:
+            parser.error("eval_only requires the saved --run_dir")
+        ordinary = not (args.cv or args.search or args.compare_runs or args.fold_manifest or args.fixed_epochs)
+        candidate = find_resumable_run(args) if ordinary and not args.new_run else None
+        if candidate:
+            args.run_dir, args.resume = str(candidate), True
+            print(f"Auto-resuming compatible unfinished run: {candidate}", flush=True)
+        elif args.resume:
+            parser.error("No matching unfinished run found; specify its --run_dir and original settings")
+        else:
+            mode = "cv" if args.cv else "search" if args.search else "audit" if args.compare_runs else "single"
+            base = Path("runs") / f"{mode}_seed{args.seed}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+            selected, suffix = base, 1
+            while selected.exists():
+                selected = base.with_name(f"{base.name}_{suffix}")
+                suffix += 1
+            args.run_dir = str(selected)
     return args
 
 
@@ -385,6 +483,13 @@ def main():
         return run_cv(args)
     if args.search:
         return run_search(args)
+    directory = Path(args.run_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    with run_lock(directory):
+        return train_one(args)
+
+
+def train_one(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.set_num_threads(args.num_threads)
@@ -521,9 +626,12 @@ def main():
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay else None
     history, best_score, first_epoch = [], initial_result["score"] if initial_result else -1.0, 1
     swa_state, swa_count = None, 0
+    early_stop = {"best": initial_result["score"] if initial_result else None,
+                  "bad_epochs": 0, "stopped": False}
     if args.resume:
         saved = torch.load(last_path, map_location="cpu", weights_only=True)
-        ignored = {"resume", "eval_only", "run_dir", "device", "num_workers", "num_threads"}
+        ignored = {"resume", "eval_only", "run_dir", "new_run", "device", "num_workers",
+                   "num_threads", "progress_every"}
         if any(saved["args"][key] != value for key, value in vars(args).items() if key not in ignored):
             raise ValueError("Resume requires the same training options, including total epochs")
         model.load_state_dict(saved["model"])
@@ -535,7 +643,10 @@ def main():
             ema.steps = saved["ema_steps"]
         history, best_score = saved["history"], saved["best_score"]
         swa_state, swa_count = saved["swa_state"], saved["swa_count"]
+        early_stop = saved.get("early_stop", early_stop)
         first_epoch = saved["epoch"] + 1
+        if early_stop["stopped"]:
+            first_epoch = args.epochs + 1
         random.setstate(saved["random_state"])
         torch.set_rng_state(saved["torch_rng"])
         generator.set_state(saved["loader_rng"])
@@ -607,10 +718,12 @@ def main():
             current = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             swa_state = average_states(swa_state, current, swa_count) if swa_state else current
             swa_count += 1
-        raw_result = evaluate(model, valid_loader, device) if not args.fixed_epochs else None
+        raw_due = (not ema or epoch == args.epochs
+                   or (args.raw_eval_every and epoch % args.raw_eval_every == 0))
+        raw_result = evaluate(model, valid_loader, device) if not args.fixed_epochs and raw_due else None
         ema_result = evaluate(ema.model, valid_loader, device) if ema and not args.fixed_epochs else None
         selected, result, variant = model, raw_result or {}, "raw"
-        if ema_result and ema_result["score"] > raw_result["score"]:
+        if ema_result and (not raw_result or ema_result["score"] > raw_result["score"]):
             selected, result, variant = ema.model, ema_result, "ema"
         record = {"epoch": epoch, "train_loss": total_loss / seen, "lr": learning_rate,
                   "seconds": time.perf_counter() - start, "optimizer_updates": updates,
@@ -630,6 +743,8 @@ def main():
             save_candidate(selected, result, best_path, epoch, variant,
                            bool(args.train_limit or args.valid_limit))
             print(f"  Saved best_model.pt ({best_path.stat().st_size / 1024 ** 2:.2f} MiB)", flush=True)
+        should_stop = (update_early_stop(early_stop, result["score"], finishing,
+                                        args.patience, args.min_delta) if not args.fixed_epochs else False)
         scheduler.step()
         write_json(history, run_dir / "history.json")
         with (run_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -643,11 +758,17 @@ def main():
             "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(), "ema": ema.model.state_dict() if ema else None,
             "swa_state": swa_state, "swa_count": swa_count,
+            "early_stop": early_stop,
             "ema_steps": ema.steps if ema else 0, "history": history, "best_score": best_score,
             "random_state": random.getstate(), "torch_rng": torch.get_rng_state(),
             "loader_rng": generator.get_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
         }, last_path)
+        if should_stop:
+            print(f"Early stopping after epoch {epoch}: no significant improvement during "
+                  f"{args.patience} final-phase epochs.", flush=True)
+            break
+    completed_epoch = history[-1]["epoch"]
     if args.fixed_epochs:
         if args.fixed_variant == "swa":
             if not swa_state:
@@ -679,17 +800,30 @@ def main():
                    run_dir / "best_metrics.json")
         print_report(final_result, names)
         write_json(final_result, run_dir / "evaluation.json")
+        write_json({"epochs_completed": completed_epoch, "early_stopped": False,
+                    "weights_sha256": digest}, run_dir / "completed.json")
         return
-    # Candidate selection can only improve the validation score, including the starting model.
-    candidates = {"best_bn": torch.load(best_path, map_location="cpu", weights_only=True),
-                  "last_bn": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}}
-    if ema:
-        candidates["ema_bn"] = {key: value.detach().cpu().clone() for key, value in ema.model.state_dict().items()}
+    # Preserve a post-training best on resume before considering an unevaluated last raw model.
+    need_last_raw = history[-1]["raw_score"] is None
+    last_state = ({key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                  if need_last_raw or args.bn_candidates == "all" else None)
+    last_result = evaluate(model, valid_loader, device) if need_last_raw else None
+    retained = torch.load(best_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(retained)
+    best_score = max(best_score, evaluate(model, valid_loader, device)["score"])
+    if last_result and last_result["score"] > best_score:
+        best_score = last_result["score"]
+        model.load_state_dict(last_state)
+        save_candidate(model, last_result, best_path, completed_epoch, "last_raw",
+                       bool(args.train_limit or args.valid_limit))
+        retained = last_state
+    candidates = {"best_bn": retained}
+    if args.bn_candidates == "all":
+        candidates["last_bn"] = last_state
+        if ema:
+            candidates["ema_bn"] = {key: value.detach().cpu().clone() for key, value in ema.model.state_dict().items()}
     if swa_state:
         candidates["swa_bn"] = swa_state
-    model.load_state_dict(candidates["best_bn"])
-    # A resumed, completed run may already contain a better post-training candidate.
-    best_score = max(best_score, evaluate(model, valid_loader, device)["score"])
     if not args.no_bn_recalibration:
         clean_loader = clean_training_loader(args)
         # DataLoader consumes RNG even without shuffling. Preserve training RNG for reproducibility.
@@ -701,13 +835,16 @@ def main():
             print(f"Final candidate {variant}: mean Macro-F1 {result['score']:.4f}", flush=True)
             if result["score"] > best_score:
                 best_score = result["score"]
-                save_candidate(model, result, best_path, args.epochs, variant,
+                save_candidate(model, result, best_path, completed_epoch, variant,
                                bool(args.train_limit or args.valid_limit))
         torch.set_rng_state(rng)
     model.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
     final_result = evaluate(model, valid_loader, device)
     print_report(final_result, names)
     write_json(final_result, run_dir / "evaluation.json")
+    write_json({"epochs_completed": completed_epoch, "early_stopped": early_stop["stopped"],
+                "weights_sha256": hashlib.sha256(best_path.read_bytes()).hexdigest()},
+               run_dir / "completed.json")
 
 
 def prediction_metrics(labels, predictions):

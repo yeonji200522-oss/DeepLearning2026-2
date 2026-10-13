@@ -21,6 +21,7 @@ from dataset import get_transforms, PlantDataset, grouped_folds, fold_indices
 from train import (macro_f1, evaluate, load_initial_weights, mix_batch, average_states,
                    recalibrate_bn, configure_regularization)
 from train import paired_bootstrap, sam_perturb, sam_restore, suspend_bn_updates
+from train import find_resumable_run, run_lock, update_early_stop
 
 spec = importlib.util.spec_from_file_location("official_checker", PROJECT / "check_submission.py")
 checker = importlib.util.module_from_spec(spec)
@@ -79,6 +80,16 @@ class SubmissionContractTests(unittest.TestCase):
         self.assertAlmostEqual(score, checker.macro_f1(pairs, 3), places=6)
         self.assertAlmostEqual(score, (0.5 + 2 / 3 + 0) / 3, places=6)
         self.assertEqual(per_class[2], 0)
+
+    def test_early_stopping_waits_for_final_phase_and_resets_on_improvement(self):
+        state = {"best": None, "bad_epochs": 0, "stopped": False}
+        for score in (0.9, 0.901, 0.9, 0.9):
+            self.assertFalse(update_early_stop(state, score, False, 2, 0.0002))
+        self.assertEqual(state["bad_epochs"], 0)
+        self.assertFalse(update_early_stop(state, 0.9011, True, 2, 0.0002))
+        self.assertTrue(update_early_stop(state, 0.9011, True, 2, 0.0002))
+        self.assertFalse(update_early_stop(state, 0.902, True, 2, 0.0002))
+        self.assertEqual(state["bad_epochs"], 0)
 
     def test_crop_spatial_route_changes_crop_without_changing_health(self):
         torch.manual_seed(23)
@@ -289,6 +300,64 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         return result
 
+    def test_default_run_auto_resumes_after_disconnect_and_rejects_live_duplicate(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(prefix="leaf-auto-resume-") as temporary:
+            root = Path(temporary)
+            work = root / "project"
+            work.mkdir()
+            self.tiny_data(root / "data")
+            for name in ("model.py", "dataset.py", "train.py"):
+                (work / name).write_bytes((PROJECT / name).read_bytes())
+            options = ["--data_dir", str(root / "data"), "--epochs", "3", "--batch_size", "8",
+                       "--num_workers", "0", "--device", "cpu"]
+            wrapper = ("import train; original=train.atomic_save\n"
+                       "def disconnect(value,path):\n"
+                       " original(value,path)\n"
+                       " if path.name == 'last_checkpoint.pt': raise SystemExit(75)\n"
+                       "train.atomic_save=disconnect; train.main()\n")
+            interrupted = subprocess.run([sys.executable, "-c", wrapper, *options], cwd=work,
+                                         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(interrupted.returncode, 75, interrupted.stdout)
+            run = next((work / "runs").glob("single_*"))
+            config = json.loads((run / "config.json").read_text())
+            args = SimpleNamespace(**config["args"])
+            with run_lock(run):
+                with self.assertRaisesRegex(RuntimeError, "already running"):
+                    find_resumable_run(args, work, work / "runs")
+            resumed = subprocess.run([sys.executable, "train.py", *options], cwd=work,
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(resumed.returncode, 0, resumed.stdout)
+            self.assertIn("Auto-resuming", resumed.stdout)
+            self.assertEqual(len(list((work / "runs").glob("single_*"))), 1)
+            checkpoint = torch.load(run / "last_checkpoint.pt", weights_only=True)
+            self.assertEqual([row["epoch"] for row in checkpoint["history"]], [1, 2, 3])
+            self.assertEqual(checkpoint["swa_count"], 0)
+            self.assertEqual(checkpoint["args"]["sam_rho"], 0)
+            self.assertIsNone(checkpoint["history"][0]["raw_score"])
+            self.assertTrue((run / "completed.json").is_file())
+            self.assertIsNone(find_resumable_run(args, work, work / "runs"))
+
+    def test_early_stopped_run_saves_checkpoint_and_resume_does_not_train_more(self):
+        with tempfile.TemporaryDirectory(prefix="leaf-early-stop-") as temporary:
+            root = Path(temporary)
+            self.tiny_data(root / "data")
+            run = root / "run"
+            options = ["--data_dir", str(root / "data"), "--run_dir", str(run), "--epochs", "10",
+                       "--batch_size", "8", "--num_workers", "0", "--device", "cpu",
+                       "--finish_fraction", "0.5", "--patience", "1", "--min_delta", "1.0"]
+            result = self.execute(options)
+            self.assertIn("Early stopping after epoch 6", result.stdout)
+            checkpoint = torch.load(run / "last_checkpoint.pt", weights_only=True)
+            self.assertEqual(checkpoint["epoch"], 6)
+            self.assertTrue(checkpoint["early_stop"]["stopped"])
+            before = torch.load(run / "best_model.pt", weights_only=True)
+            self.execute(options + ["--resume"])
+            self.assertEqual(torch.load(run / "last_checkpoint.pt", weights_only=True)["epoch"], 6)
+            after = torch.load(run / "best_model.pt", weights_only=True)
+            for key in before:
+                torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
+
     def test_internal_fold_training_does_not_need_official_valid(self):
         with tempfile.TemporaryDirectory(prefix="leaf-fold-") as directory:
             root = Path(directory)
@@ -379,7 +448,8 @@ class TrainingIntegrationTests(unittest.TestCase):
             search = root / "search"
             common = ["--data_dir", str(data), "--epochs", "2", "--batch_size", "4",
                       "--train_limit", "8", "--valid_limit", "8", "--num_workers", "0",
-                      "--device", "cpu", "--mixup_prob", "1", "--finish_fraction", "0.5"]
+                      "--device", "cpu", "--mixup_prob", "1", "--finish_fraction", "0.5",
+                      "--swa_start", "0.5"]
 
             def execute(extra):
                 result = subprocess.run([sys.executable, "train.py", *common, *extra], cwd=PROJECT,
