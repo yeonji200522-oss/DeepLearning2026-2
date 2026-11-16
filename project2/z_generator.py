@@ -121,6 +121,97 @@ def optimize(G, C, target, ft, rand_mse, rand_cos, init, steps, lr, batch, weigh
 
 
 @torch.no_grad()
+def evaluate_existing(G, C, target, ft, rand_mse, rand_cos, z, batch=20):
+    """Compute the same reference scores as score.py for an existing submission."""
+    values, pixels, features = [], [], []
+    for start in range(0, len(z), batch):
+        stop = min(start + batch, len(z))
+        x = G(z[start:stop])
+        fx = normalized_features(C, x)
+        value, pixel, feature, _, _ = scores(
+            x, target[start:stop], fx, ft[start:stop],
+            rand_mse[start:stop], rand_cos[start:stop]
+        )
+        values.append(value)
+        pixels.append(pixel)
+        features.append(feature)
+    return torch.cat(values), torch.cat(pixels), torch.cat(features)
+
+
+def refine_pixels(G, C, target, ft, rand_mse, rand_cos,
+                  base_z, base_scores, base_pixel, base_feature,
+                  steps, lr, feature_weight, batch_size,
+                  restarts=2, noise=0.03, max_feature_drop=0.02):
+    """Refine z for pixels, preserving public score and limiting feature loss.
+
+    The original candidate is kept unless a candidate improves pixel score,
+    preserves the starting combined public score and keeps feature score
+    within max_feature_drop of its starting value.
+    """
+    n, dim = base_z.shape
+    refined_z = base_z.clone()
+    chosen_score = base_scores.clone()
+    chosen_pixel = base_pixel.clone()
+    chosen_feature = base_feature.clone()
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        b = stop - start
+        init = base_z[start:stop, None, :].repeat(1, restarts, 1)
+        if restarts > 1 and noise > 0:
+            init[:, 1:] += torch.randn_like(init[:, 1:]) * noise
+        z = torch.nn.Parameter(init.reshape(b * restarts, dim).clone())
+        project_norm_(z)
+        optimizer = torch.optim.Adam([z], lr=lr)
+        t = target[start:stop].repeat_interleave(restarts, 0)
+        f = ft[start:stop].repeat_interleave(restarts, 0)
+        rm = rand_mse[start:stop].repeat_interleave(restarts)
+        rc = rand_cos[start:stop].repeat_interleave(restarts)
+        baseline_total = base_scores[start:stop, None]
+        feature_floor = base_feature[start:stop, None] - max_feature_drop
+
+        for iteration in range(steps + 1):
+            x = G(z)
+            fx = normalized_features(C, x)
+            total, pixel, feature, mse, cosine = scores(x, t, fx, f, rm, rc)
+            with torch.no_grad():
+                totals = total.detach().reshape(b, restarts)
+                pixels = pixel.detach().reshape(b, restarts)
+                features = feature.detach().reshape(b, restarts)
+                eligible = (
+                    (pixels > chosen_pixel[start:stop, None] + 1e-6)
+                    & (features >= feature_floor)
+                    & (totals + 1e-7 >= baseline_total)
+                )
+                candidates = pixels.masked_fill(~eligible, -1.0)
+                val, index = candidates.max(dim=1)
+                keep = val >= 0
+                row = torch.arange(b, device=z.device)
+                chosen_z = z.detach().reshape(b, restarts, dim)[row, index]
+                refined_z[start:stop][keep] = chosen_z[keep]
+                chosen_score[start:stop][keep] = totals[row, index][keep]
+                chosen_pixel[start:stop][keep] = val[keep]
+                chosen_feature[start:stop][keep] = features[row, index][keep]
+
+            if iteration == steps:
+                break
+            pix_loss = mse / rm
+            feature_loss = (1 - cosine) / (1 - rc).clamp_min(1e-6)
+            loss = ((1 - feature_weight) * pix_loss +
+                    feature_weight * feature_loss).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            project_norm_(z)
+
+        changed = int((chosen_pixel[start:stop] > base_pixel[start:stop] + 1e-6).sum())
+        print(f"Pixel stage {stop}/{n}, improved {changed}/{b}, "
+              f"pixel={chosen_pixel[:stop].mean().item():.4f}, "
+              f"feature={chosen_feature[:stop].mean().item():.4f}", flush=True)
+
+    return refined_z, chosen_score, chosen_pixel, chosen_feature
+
+
+@torch.no_grad()
 def save_comparisons(G, targets, z, values):
     faces = torch.cat([G(z[i:i + 20]) for i in range(0, len(z), 20)])
     rows = []
@@ -138,12 +229,20 @@ def main():
     p.add_argument("--generator", default="G.pt")
     p.add_argument("--classifier", default="classifier.pt")
     p.add_argument("--out", default="z.pt")
+    p.add_argument("--resume_z", default=None,
+                   help="Existing z.pt; skip initial search and stage-1 optimization")
     p.add_argument("--n_random", type=int, default=1000)
     p.add_argument("--topk", type=int, default=2)
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--lr", type=float, default=0.04)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--feature_weight", type=float, default=0.5)
+    p.add_argument("--pixel_steps", type=int, default=0)
+    p.add_argument("--pixel_lr", type=float, default=0.015)
+    p.add_argument("--pixel_feature_weight", type=float, default=0.20)
+    p.add_argument("--pixel_restarts", type=int, default=2)
+    p.add_argument("--pixel_noise", type=float, default=0.03)
+    p.add_argument("--max_feature_drop", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     a = p.parse_args()
@@ -151,6 +250,10 @@ def main():
         p.error("Require n_random >= topk >= 1, steps >= 0, batch_size >= 1")
     if not (0 <= a.feature_weight <= 1) or a.lr <= 0:
         p.error("Require 0 <= feature_weight <= 1 and lr > 0")
+    if (a.pixel_steps < 0 or a.pixel_lr <= 0 or a.pixel_restarts < 1 or
+            a.pixel_noise < 0 or a.max_feature_drop < 0 or
+            not (0 <= a.pixel_feature_weight <= 1)):
+        p.error("Invalid pixel refinement arguments")
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if a.device == "auto" else a.device
     torch.manual_seed(a.seed)
@@ -168,13 +271,43 @@ def main():
         ft = torch.cat([normalized_features(C, target[i:i + 50])
                         for i in range(0, len(target), 50)])
     rand_mse, rand_cos = reference_stats(G, C, target, ft)
-    init, init_vals = random_start(G, C, target, ft, rand_mse, rand_cos,
-                                  a.n_random, a.topk)
-    print(f"Initial reference score {init_vals[:, 0].mean().item()*100:.2f}", flush=True)
-    z, values, pix, feat = optimize(
-        G, C, target, ft, rand_mse, rand_cos, init,
-        a.steps, a.lr, a.batch_size, a.feature_weight
-    )
+    if a.resume_z:
+        z = torch.load(a.resume_z, map_location="cpu", weights_only=True)
+        if not isinstance(z, torch.Tensor) or tuple(z.shape) != (len(target), 128):
+            raise ValueError("resume_z must have shape (N, 128)")
+        z = z.to(device=device, dtype=torch.float32)
+        if not torch.isfinite(z).all():
+            raise ValueError("resume_z contains NaN/inf")
+        if not ((z.norm(dim=1) >= 8.5) & (z.norm(dim=1) <= 14.1)).all():
+            raise ValueError("resume_z violates z norm limits")
+        values, pix, feat = evaluate_existing(G, C, target, ft, rand_mse, rand_cos, z)
+        print(f"Loaded previous z: local={values.mean().item()*100:.2f}, "
+              f"pixel={pix.mean().item():.4f}, feature={feat.mean().item():.4f}", flush=True)
+    else:
+        init, init_vals = random_start(G, C, target, ft, rand_mse, rand_cos,
+                                      a.n_random, a.topk)
+        print(f"Initial reference score {init_vals[:, 0].mean().item()*100:.2f}", flush=True)
+        z, values, pix, feat = optimize(
+            G, C, target, ft, rand_mse, rand_cos, init,
+            a.steps, a.lr, a.batch_size, a.feature_weight
+        )
+        print(f"After stage 1: local={values.mean().item()*100:.2f}, "
+              f"pixel={pix.mean().item():.4f}, feature={feat.mean().item():.4f}", flush=True)
+
+    if a.pixel_steps > 0:
+        old_total, old_pix, old_feat = values.clone(), pix.clone(), feat.clone()
+        torch.save(z.detach().cpu().float(), "z_before_pixel.pt")
+        z, values, pix, feat = refine_pixels(
+            G, C, target, ft, rand_mse, rand_cos, z, values, pix, feat,
+            steps=a.pixel_steps, lr=a.pixel_lr,
+            feature_weight=a.pixel_feature_weight, batch_size=a.batch_size,
+            restarts=a.pixel_restarts, noise=a.pixel_noise,
+            max_feature_drop=a.max_feature_drop
+        )
+        print(f"Pixel: {old_pix.mean().item():.4f} -> {pix.mean().item():.4f}")
+        print(f"Feature: {old_feat.mean().item():.4f} -> {feat.mean().item():.4f}")
+        print(f"Local score: {old_total.mean().item()*100:.2f} -> {values.mean().item()*100:.2f}")
+        print(f"Improved pixel for {(pix > old_pix + 1e-6).sum().item()}/{len(pix)} images")
     result = z.detach().cpu().float()
     if result.shape != (len(target), 128) or not torch.isfinite(result).all():
         raise ValueError("Invalid submission tensor")
