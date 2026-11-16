@@ -49,3 +49,17 @@ python score.py --z z.pt
 The initial version was smoke-tested on **two** target images. It has **not yet been scored on all 200**. Record experiment scores, parameters, timings, and failure cases for the report.
 
 **Deadline:** 2026-11-17 23:59 KST. Submit `z.pt` to leaderboard and a PDF report (at least two A4 pages) to e-class.
+
+## Pixel-priority refinement (v2)
+
+If you have already produced a strong `z.pt` (e.g., v1), **keep that file** and run a second pass without searching from scratch:
+
+```bash
+cp z.pt z_v1_backup.pt
+python z_generator.py --resume_z z_v1_backup.pt --out z_pixel_v2.pt --pixel_steps 80 --pixel_lr 0.015 --pixel_feature_weight 0.20 --pixel_restarts 2 --max_feature_drop 0.02
+python score.py --z z_pixel_v2.pt
+```
+
+For each target, v2 accepts a new vector only if its pixel score is higher, its combined **public-classifier** score is not below the starting score, and its feature score has declined by no more than 0.02. This is a **local reference-score safeguard**; it does not guarantee the hidden leaderboard feature score will improve. The original tensor is preserved as `z_v1_backup.pt` and an additional `z_before_pixel.pt` is written locally. Generated images and all `.pt` files remain gitignored.
+
+If you prefer to start from scratch, first run v1 settings with `--pixel_steps 0`, then refine that output using `--resume_z`. Review pixel, feature, and combined scores from `score.py` before submitting.
