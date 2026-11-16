@@ -1,0 +1,12 @@
+# Private course data and model weights
+*.pt
+*.pth
+*.npy
+# Target-image comparisons / generated results
+compare.png
+worst.png
+*comparison*.png
+# Local work
+__pycache__/
+.pytest_cache/
+*.pyc
