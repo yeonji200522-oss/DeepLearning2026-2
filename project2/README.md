@@ -63,3 +63,20 @@ python score.py --z z_pixel_v2.pt
 For each target, v2 accepts a new vector only if its pixel score is higher, its combined **public-classifier** score is not below the starting score, and its feature score has declined by no more than 0.02. This is a **local reference-score safeguard**; it does not guarantee the hidden leaderboard feature score will improve. The original tensor is preserved as `z_v1_backup.pt` and an additional `z_before_pixel.pt` is written locally. Generated images and all `.pt` files remain gitignored.
 
 If you prefer to start from scratch, first run v1 settings with `--pixel_steps 0`, then refine that output using `--resume_z`. Review pixel, feature, and combined scores from `score.py` before submitting.
+
+## V4 — balanced multistart search (experimental)
+
+A new branch retains V3 unchanged while testing candidate diversity and targeted refinement. The final deliverable is still **only** `z.pt`; do not commit model weights or the private face images.
+
+Use the professor's supplied `generator.py`, `classifier.py`, `score.py`, `G.pt`, `classifier.pt`, and `targets200.npy` locally. Replace **only** `z_generator.py` with this branch's version, then simply run:
+
+```bash
+python z_generator.py
+python score.py
+```
+
+V4 defaults: 3,000 initial latent samples, 4 starting candidates (2 balanced, 2 pixel-oriented), 120 Adam updates with candidate-specific feature loss weights, 80 pixel-focused refinement updates, and 60 extra updates for the lowest-scoring 25% of targets. Weights of G and C remain frozen. Latent L2 norm is constrained to [8.6, 14.0].
+
+Small tests (6–12 targets) showed that changing feature weight alters pixel/feature tradeoffs, but **V4 has not been validated on all 200 and has no confirmed leaderboard improvement**. The public classifier feature score can differ substantially from the hidden leaderboard's feature score, so keep and compare previous submissions. The score target 91 is a goal, not a guaranteed result.
+
+This program is a research experiment. Submit only after the `score.py` shape, NaN, and norm checks pass. Report the actual run parameters and results, including unsuccessful experiments.
