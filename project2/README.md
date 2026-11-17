@@ -80,3 +80,11 @@ V4 defaults: 3,000 initial latent samples, 4 starting candidates (2 balanced, 2 
 Small tests (6–12 targets) showed that changing feature weight alters pixel/feature tradeoffs, but **V4 has not been validated on all 200 and has no confirmed leaderboard improvement**. The public classifier feature score can differ substantially from the hidden leaderboard's feature score, so keep and compare previous submissions. The score target 91 is a goal, not a guaranteed result.
 
 This program is a research experiment. Submit only after the `score.py` shape, NaN, and norm checks pass. Report the actual run parameters and results, including unsuccessful experiments.
+
+## Multi-seed merge — default in the current V4 script
+
+Running `python z_generator.py` now performs a full optimization for seed 0, additional shorter searches for seeds 1 and 2, and combines candidates **per target image**. The merge requires an improved local total score, no more than a 0.002 drop in local pixel score, and no more than a 0.015 drop in public-classifier feature score. Pixel and hard-face refinement run once on the merged candidates. Only one submission tensor `z.pt` is saved (shape `200 x 128`); there are no intermediate `.pt` outputs by default.
+
+Use `--seeds 0,1,2,3` to override the seeds; `--extra_random`, `--extra_topk`, and `--extra_steps` control the additional search passes. More seeds cost more compute. Retain previous submissions privately and evaluate the actual leaderboard score: local reference improvement does not guarantee improvement against the private classifier.
+
+The generator/classifier architecture and pretrained weights remain unchanged; do not upload the course-private targets or comparison images.
