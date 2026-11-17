@@ -50,7 +50,7 @@ def scores(x, target, fx, ft, rand_mse, rand_cos):
 @torch.no_grad()
 def random_start(G, C, target, ft, rand_mse, rand_cos, n_random, topk, chunk=32):
     """Find the best topk initial z vectors independently for every image."""
-    vals, latents = [], []
+    vals, pixels_all, latents = [], [], []
     for start in range(0, n_random, chunk):
         z = torch.randn(min(chunk, n_random - start), 128, device=target.device)
         project_norm_(z)
@@ -62,13 +62,23 @@ def random_start(G, C, target, ft, rand_mse, rand_cos, n_random, topk, chunk=32)
         feature = ((cos - rand_cos[:, None]) /
                    (1 - rand_cos[:, None]).clamp_min(1e-6)).clamp(0, 1)
         vals.append((pixel + feature) / 2)
+        pixels_all.append(pixel)
         latents.append(z)
     vals, latents = torch.cat(vals, dim=1), torch.cat(latents)
-    idx = vals.topk(topk, dim=1).indices
+    pixels_all = torch.cat(pixels_all, dim=1)
+    # Mix high-total-score and high-pixel-score starting points.
+    n_balanced = max(1, topk // 2)
+    n_pixel = topk - n_balanced
+    balanced = vals.topk(n_balanced, dim=1).indices
+    if n_pixel:
+        pixel_best = pixels_all.topk(n_pixel, dim=1).indices
+        idx = torch.cat([balanced, pixel_best], dim=1)
+    else:
+        idx = balanced
     return latents[idx], vals.gather(1, idx)
 
 
-def optimize(G, C, target, ft, rand_mse, rand_cos, init, steps, lr, batch, weight):
+def optimize(G, C, target, ft, rand_mse, rand_cos, init, steps, lr, batch, weight, coarse_weight=0.2):
     n, k, dim = init.shape
     best_z = torch.empty((n, dim), device=target.device)
     best_scores = torch.empty(n, device=target.device)
@@ -104,7 +114,8 @@ def optimize(G, C, target, ft, rand_mse, rand_cos, init, steps, lr, batch, weigh
             if step == steps:
                 break
             # Differentiable, unclipped normalized surrogate of the scoring rule.
-            loss = ((1 - weight) * mse / rm +
+            coarse = (F.avg_pool2d(x, 4) - F.avg_pool2d(t, 4)).square().mean((1, 2, 3)) / rm
+            loss = ((1 - weight) * (mse / rm + coarse_weight * coarse) +
                     weight * (1 - cosine) / (1 - rc).clamp_min(1e-6)).mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -141,7 +152,8 @@ def evaluate_existing(G, C, target, ft, rand_mse, rand_cos, z, batch=20):
 def refine_pixels(G, C, target, ft, rand_mse, rand_cos,
                   base_z, base_scores, base_pixel, base_feature,
                   steps, lr, feature_weight, batch_size,
-                  restarts=2, noise=0.03, max_feature_drop=0.02):
+                  restarts=2, noise=0.03, max_feature_drop=0.02,
+                  coarse_weight=0.2):
     """Refine z for pixels, preserving public score and limiting feature loss.
 
     The original candidate is kept unless a candidate improves pixel score,
@@ -195,8 +207,9 @@ def refine_pixels(G, C, target, ft, rand_mse, rand_cos,
             if iteration == steps:
                 break
             pix_loss = mse / rm
+            coarse_loss = (F.avg_pool2d(x, 4) - F.avg_pool2d(t, 4)).square().mean((1, 2, 3)) / rm
             feature_loss = (1 - cosine) / (1 - rc).clamp_min(1e-6)
-            loss = ((1 - feature_weight) * pix_loss +
+            loss = ((1 - feature_weight) * (pix_loss + coarse_weight * coarse_loss) +
                     feature_weight * feature_loss).mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -231,17 +244,18 @@ def main():
     p.add_argument("--out", default="z.pt")
     p.add_argument("--resume_z", default=None,
                    help="Existing z.pt; skip initial search and stage-1 optimization")
-    p.add_argument("--n_random", type=int, default=1000)
-    p.add_argument("--topk", type=int, default=2)
-    p.add_argument("--steps", type=int, default=50)
-    p.add_argument("--lr", type=float, default=0.04)
+    p.add_argument("--n_random", type=int, default=2500)
+    p.add_argument("--topk", type=int, default=4)
+    p.add_argument("--steps", type=int, default=120)
+    p.add_argument("--lr", type=float, default=0.035)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--feature_weight", type=float, default=0.5)
-    p.add_argument("--pixel_steps", type=int, default=80)
-    p.add_argument("--pixel_lr", type=float, default=0.015)
-    p.add_argument("--pixel_feature_weight", type=float, default=0.20)
-    p.add_argument("--pixel_restarts", type=int, default=2)
-    p.add_argument("--pixel_noise", type=float, default=0.03)
+    p.add_argument("--feature_weight", type=float, default=0.15)
+    p.add_argument("--coarse_weight", type=float, default=0.20)
+    p.add_argument("--pixel_steps", type=int, default=100)
+    p.add_argument("--pixel_lr", type=float, default=0.012)
+    p.add_argument("--pixel_feature_weight", type=float, default=0.12)
+    p.add_argument("--pixel_restarts", type=int, default=3)
+    p.add_argument("--pixel_noise", type=float, default=0.06)
     p.add_argument("--max_feature_drop", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -250,6 +264,8 @@ def main():
         p.error("Require n_random >= topk >= 1, steps >= 0, batch_size >= 1")
     if not (0 <= a.feature_weight <= 1) or a.lr <= 0:
         p.error("Require 0 <= feature_weight <= 1 and lr > 0")
+    if a.coarse_weight < 0:
+        p.error("coarse_weight must be nonnegative")
     if (a.pixel_steps < 0 or a.pixel_lr <= 0 or a.pixel_restarts < 1 or
             a.pixel_noise < 0 or a.max_feature_drop < 0 or
             not (0 <= a.pixel_feature_weight <= 1)):
@@ -289,7 +305,8 @@ def main():
         print(f"Initial reference score {init_vals[:, 0].mean().item()*100:.2f}", flush=True)
         z, values, pix, feat = optimize(
             G, C, target, ft, rand_mse, rand_cos, init,
-            a.steps, a.lr, a.batch_size, a.feature_weight
+            a.steps, a.lr, a.batch_size, a.feature_weight,
+            coarse_weight=a.coarse_weight
         )
         print(f"After stage 1: local={values.mean().item()*100:.2f}, "
               f"pixel={pix.mean().item():.4f}, feature={feat.mean().item():.4f}", flush=True)
@@ -302,7 +319,8 @@ def main():
             steps=a.pixel_steps, lr=a.pixel_lr,
             feature_weight=a.pixel_feature_weight, batch_size=a.batch_size,
             restarts=a.pixel_restarts, noise=a.pixel_noise,
-            max_feature_drop=a.max_feature_drop
+            max_feature_drop=a.max_feature_drop,
+            coarse_weight=a.coarse_weight
         )
         print(f"Pixel: {old_pix.mean().item():.4f} -> {pix.mean().item():.4f}")
         print(f"Feature: {old_feat.mean().item():.4f} -> {feat.mean().item():.4f}")
