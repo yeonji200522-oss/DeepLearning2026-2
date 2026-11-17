@@ -277,6 +277,11 @@ def main():
     p.add_argument("--hard_noise", type=float, default=0.16)
     p.add_argument("--max_feature_drop", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
+    # Automatically try three seeds in one run. Only ONE z.pt will be saved.
+    p.add_argument("--seeds", default=None, help="Optional comma-separated seeds, e.g. 0,1,2")
+    p.add_argument("--extra_random", type=int, default=1600)
+    p.add_argument("--extra_topk", type=int, default=3)
+    p.add_argument("--extra_steps", type=int, default=70)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     a = p.parse_args()
     if a.topk < 1 or a.n_random < a.topk or a.steps < 0 or a.batch_size < 1:
@@ -285,6 +290,15 @@ def main():
         p.error("Require 0 <= feature_weight <= 1 and lr > 0")
     if a.coarse_weight < 0:
         p.error("coarse_weight must be nonnegative")
+    if a.extra_random < a.extra_topk or a.extra_topk < 1 or a.extra_steps < 0:
+        p.error("Require extra_random >= extra_topk >= 1 and extra_steps >= 0")
+    try:
+        seeds = ([int(part.strip()) for part in a.seeds.split(",")]
+                 if a.seeds is not None else [a.seed, a.seed + 1, a.seed + 2])
+        if not seeds or any(seed < 0 for seed in seeds) or len(seeds) != len(set(seeds)):
+            raise ValueError("seeds must be unique nonnegative integers")
+    except ValueError:
+        p.error("--seeds must contain unique nonnegative integers, e.g. 0,1,2")
     if not (0 <= a.hard_fraction <= 1) or a.hard_steps < 0 or a.hard_noise < 0:
         p.error("Invalid hard-target optimization arguments")
     if (a.pixel_steps < 0 or a.pixel_lr <= 0 or a.pixel_restarts < 1 or
@@ -321,20 +335,63 @@ def main():
         print(f"Loaded previous z: local={values.mean().item()*100:.2f}, "
               f"pixel={pix.mean().item():.4f}, feature={feat.mean().item():.4f}", flush=True)
     else:
-        init, init_vals = random_start(G, C, target, ft, rand_mse, rand_cos,
-                                      a.n_random, a.topk)
-        print(f"Initial reference score {init_vals[:, 0].mean().item()*100:.2f}", flush=True)
-        z, values, pix, feat = optimize(
-            G, C, target, ft, rand_mse, rand_cos, init,
-            a.steps, a.lr, a.batch_size, a.feature_weight,
-            coarse_weight=a.coarse_weight
-        )
-        print(f"After stage 1: local={values.mean().item()*100:.2f}, "
+        # Each seed is independent, but the best vector is retained PER IMAGE.
+        # Seed 0 takes the full V4 optimization path.
+        best_z = best_score = best_pixel = best_feature = None
+        source_seed = torch.full((len(target),), -1, dtype=torch.long, device=device)
+        for run_idx, seed in enumerate(seeds):
+            if run_idx or seed != a.seed:
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+            full_run = run_idx == 0
+            num_random = a.n_random if full_run else a.extra_random
+            topk = a.topk if full_run else a.extra_topk
+            steps = a.steps if full_run else a.extra_steps
+            print(f"Seed {seed} ({run_idx + 1}/{len(seeds)}): "
+                  f"random={num_random}, topk={topk}, Adam steps={steps}", flush=True)
+            init, init_vals = random_start(
+                G, C, target, ft, rand_mse, rand_cos, num_random, topk
+            )
+            zz, vv, pp, ff = optimize(
+                G, C, target, ft, rand_mse, rand_cos, init,
+                steps, a.lr, a.batch_size, a.feature_weight,
+                coarse_weight=a.coarse_weight
+            )
+            if best_z is None:
+                best_z, best_score, best_pixel, best_feature = (
+                    zz.clone(), vv.clone(), pp.clone(), ff.clone()
+                )
+                source_seed.fill_(seed)
+                print(f"Seed {seed}: initial full set local "
+                      f"{best_score.mean().item() * 100:.2f}", flush=True)
+            else:
+                # Public classifier may not match the leaderboard. Do not
+                # exchange large pixel/feature losses for tiny local gains.
+                keep = (
+                    (vv > best_score + 1e-6)
+                    & (pp >= best_pixel - 0.002)
+                    & (ff >= best_feature - 0.015)
+                )
+                count = int(keep.sum().item())
+                best_z[keep] = zz[keep]
+                best_score[keep] = vv[keep]
+                best_pixel[keep] = pp[keep]
+                best_feature[keep] = ff[keep]
+                source_seed[keep] = seed
+                print(f"Seed {seed}: improved {count}/{len(target)} targets; "
+                      f"merged local={best_score.mean().item()*100:.2f}, "
+                      f"pixel={best_pixel.mean().item():.4f}, "
+                      f"feature={best_feature.mean().item():.4f}", flush=True)
+        z, values, pix, feat = best_z, best_score, best_pixel, best_feature
+        print("Selected seed counts:", {
+            seed: int((source_seed == seed).sum().item()) for seed in seeds
+        }, flush=True)
+        print(f"After multi-seed search: local={values.mean().item()*100:.2f}, "
               f"pixel={pix.mean().item():.4f}, feature={feat.mean().item():.4f}", flush=True)
 
     if a.pixel_steps > 0:
         old_total, old_pix, old_feat = values.clone(), pix.clone(), feat.clone()
-        torch.save(z.detach().cpu().float(), "z_before_pixel.pt")
         z, values, pix, feat = refine_pixels(
             G, C, target, ft, rand_mse, rand_cos, z, values, pix, feat,
             steps=a.pixel_steps, lr=a.pixel_lr,
