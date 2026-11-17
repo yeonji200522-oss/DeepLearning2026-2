@@ -88,3 +88,11 @@ Running `python z_generator.py` now performs a full optimization for seed 0, add
 Use `--seeds 0,1,2,3` to override the seeds; `--extra_random`, `--extra_topk`, and `--extra_steps` control the additional search passes. More seeds cost more compute. Retain previous submissions privately and evaluate the actual leaderboard score: local reference improvement does not guarantee improvement against the private classifier.
 
 The generator/classifier architecture and pretrained weights remain unchanged; do not upload the course-private targets or comparison images.
+
+## V5 improvement within the same branch (single output)
+
+The latest `z_generator.py` uses **five seeds** (0–4 by default) in one run, with the first search at 3,000 random samples and later searches at 2,200 samples each. It keeps promising per-image results, refines pixels for 100 steps, and revisits the lowest-scoring 35% for 90 extra steps. The final submission remains **one `z.pt` tensor**.
+
+If `z.pt` already exists in the working directory, it is considered as a candidate before random search and is replaced only at the end of a successful run. To safely preserve the earlier submission, keep a private copy outside this folder before running. Local model weights, targets and image comparisons must not be added to the public repository.
+
+These values represent an experimental search expansion; the previously reported Public score (88.25) is not a verified score for this update. Consider using a Colab GPU and check runtime before launch.
