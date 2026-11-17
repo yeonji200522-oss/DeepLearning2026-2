@@ -237,7 +237,7 @@ def main():
     p.add_argument("--lr", type=float, default=0.04)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--feature_weight", type=float, default=0.5)
-    p.add_argument("--pixel_steps", type=int, default=0)
+    p.add_argument("--pixel_steps", type=int, default=80)
     p.add_argument("--pixel_lr", type=float, default=0.015)
     p.add_argument("--pixel_feature_weight", type=float, default=0.20)
     p.add_argument("--pixel_restarts", type=int, default=2)
