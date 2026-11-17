@@ -1,6 +1,7 @@
 """Optimize the 200 latent vectors, not the supplied GAN or classifier weights."""
 import argparse
 import time
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -267,21 +268,21 @@ def main():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--feature_weight", type=float, default=0.20)
     p.add_argument("--coarse_weight", type=float, default=0.20)
-    p.add_argument("--pixel_steps", type=int, default=80)
+    p.add_argument("--pixel_steps", type=int, default=100)
     p.add_argument("--pixel_lr", type=float, default=0.012)
     p.add_argument("--pixel_feature_weight", type=float, default=0.18)
     p.add_argument("--pixel_restarts", type=int, default=3)
     p.add_argument("--pixel_noise", type=float, default=0.06)
-    p.add_argument("--hard_fraction", type=float, default=0.25)
-    p.add_argument("--hard_steps", type=int, default=60)
-    p.add_argument("--hard_noise", type=float, default=0.16)
+    p.add_argument("--hard_fraction", type=float, default=0.35)
+    p.add_argument("--hard_steps", type=int, default=90)
+    p.add_argument("--hard_noise", type=float, default=0.20)
     p.add_argument("--max_feature_drop", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
-    # Automatically try three seeds in one run. Only ONE z.pt will be saved.
+    # Search five seeds in one run; only ONE z.pt will be saved.
     p.add_argument("--seeds", default=None, help="Optional comma-separated seeds, e.g. 0,1,2")
-    p.add_argument("--extra_random", type=int, default=1600)
-    p.add_argument("--extra_topk", type=int, default=3)
-    p.add_argument("--extra_steps", type=int, default=70)
+    p.add_argument("--extra_random", type=int, default=2200)
+    p.add_argument("--extra_topk", type=int, default=4)
+    p.add_argument("--extra_steps", type=int, default=95)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     a = p.parse_args()
     if a.topk < 1 or a.n_random < a.topk or a.steps < 0 or a.batch_size < 1:
@@ -294,7 +295,7 @@ def main():
         p.error("Require extra_random >= extra_topk >= 1 and extra_steps >= 0")
     try:
         seeds = ([int(part.strip()) for part in a.seeds.split(",")]
-                 if a.seeds is not None else [a.seed, a.seed + 1, a.seed + 2])
+                 if a.seeds is not None else [a.seed + i for i in range(5)])
         if not seeds or any(seed < 0 for seed in seeds) or len(seeds) != len(set(seeds)):
             raise ValueError("seeds must be unique nonnegative integers")
     except ValueError:
@@ -339,11 +340,29 @@ def main():
         # Seed 0 takes the full V4 optimization path.
         best_z = best_score = best_pixel = best_feature = None
         source_seed = torch.full((len(target),), -1, dtype=torch.long, device=device)
+        # If a previous z.pt exists, keep it as a candidate for every face.
+        # No extra .pt file is written.
+        if Path(a.out).is_file():
+            try:
+                old = torch.load(a.out, map_location="cpu", weights_only=True)
+                if (not isinstance(old, torch.Tensor)
+                        or tuple(old.shape) != (len(target), 128)
+                        or not torch.isfinite(old).all()
+                        or not ((old.norm(dim=1) >= 8.5)
+                                & (old.norm(dim=1) <= 14.1)).all()):
+                    raise ValueError("invalid shape, values or norm")
+                old = old.to(device=device, dtype=torch.float32)
+                best_score, best_pixel, best_feature = evaluate_existing(
+                    G, C, target, ft, rand_mse, rand_cos, old)
+                best_z = old.clone()
+                print(f"Existing z.pt candidate: "
+                      f"{best_score.mean().item()*100:.2f}/100", flush=True)
+            except Exception as exc:
+                print(f"Skipping invalid previous z.pt: {exc}", flush=True)
         for run_idx, seed in enumerate(seeds):
-            if run_idx or seed != a.seed:
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
             full_run = run_idx == 0
             num_random = a.n_random if full_run else a.extra_random
             topk = a.topk if full_run else a.extra_topk
@@ -371,7 +390,7 @@ def main():
                 keep = (
                     (vv > best_score + 1e-6)
                     & (pp >= best_pixel - 0.002)
-                    & (ff >= best_feature - 0.015)
+                    & (ff >= best_feature - 0.010)
                 )
                 count = int(keep.sum().item())
                 best_z[keep] = zz[keep]
@@ -385,7 +404,8 @@ def main():
                       f"feature={best_feature.mean().item():.4f}", flush=True)
         z, values, pix, feat = best_z, best_score, best_pixel, best_feature
         print("Selected seed counts:", {
-            seed: int((source_seed == seed).sum().item()) for seed in seeds
+            **{"existing": int((source_seed == -1).sum().item())},
+            **{seed: int((source_seed == seed).sum().item()) for seed in seeds}
         }, flush=True)
         print(f"After multi-seed search: local={values.mean().item()*100:.2f}, "
               f"pixel={pix.mean().item():.4f}, feature={feat.mean().item():.4f}", flush=True)
