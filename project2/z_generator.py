@@ -338,6 +338,135 @@ def refine_semantics(G, C, target, ft, rand_mse, rand_cos,
     return result_z, result_total, result_pixel, result_feature
 
 
+def classifier_spatial_maps(C, x):
+    """Three spatial representations from the SUPPLIED, unchanged classifier."""
+    h = F.max_pool2d(F.relu(C.bn1(C.conv1(x))), 2)
+    h = F.max_pool2d(F.relu(C.bn2(C.conv2(h))), 2)
+    middle = h
+    h = F.max_pool2d(F.relu(C.bn3(C.conv3(h))), 2)
+    deep = h
+    h = F.max_pool2d(F.relu(C.bn4(C.conv4(h))), 2)
+    return (middle, deep, h)
+
+
+def spatial_distance(maps, target_maps):
+    """Mean location-aware cosine distance across intermediate feature grids."""
+    distances = []
+    for candidate, target in zip(maps, target_maps):
+        a = F.normalize(candidate, dim=1, eps=1e-6)
+        b = F.normalize(target, dim=1, eps=1e-6)
+        distances.append((1 - (a * b).sum(dim=1)).mean(dim=(1, 2)))
+    return sum(distances) / len(distances)
+
+
+def refine_spatial_identity(G, C, target, ft, rand_mse, rand_cos,
+                            base_z, base_score, base_pixel, base_feature,
+                            steps, lr, batch_size, restarts=2, noise=0.05,
+                            spatial_weight=0.12, attribute_weight=0.15):
+    """Optional last-stage identity refinement.
+
+    Only retain candidates that improve BOTH public reference total score
+    and intermediate spatial agreement, while protecting pixel/feature scores.
+    Using C's early maps can encourage pose/geometry agreement, but it is NOT
+    a validation against the server's different, hidden classifier.
+    """
+    result_z = base_z.clone()
+    result_score = base_score.clone()
+    result_pixel = base_pixel.clone()
+    result_feature = base_feature.clone()
+    n, dim = base_z.shape
+    accepted_count = 0
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        count = end - start
+        t0 = target[start:end]
+        with torch.no_grad():
+            target_maps = tuple(f.detach() for f in classifier_spatial_maps(C, t0))
+            target_raw = F.adaptive_avg_pool2d(target_maps[-1], 1).flatten(1)
+            target_attrs = torch.sigmoid(C.fc(target_raw))
+            baseline_maps = classifier_spatial_maps(C, G(base_z[start:end]))
+            best_spatial = spatial_distance(baseline_maps, target_maps)
+
+        best_z = result_z[start:end].clone()
+        best_score = result_score[start:end].clone()
+        best_pixel = result_pixel[start:end].clone()
+        best_feature = result_feature[start:end].clone()
+
+        init = base_z[start:end, None, :].repeat(1, restarts, 1)
+        if restarts > 1 and noise:
+            init[:, 1:, :] += torch.randn_like(init[:, 1:, :]) * noise
+        z = torch.nn.Parameter(init.reshape(count * restarts, dim).clone())
+        project_norm_(z)
+        optimizer = torch.optim.Adam([z], lr=lr)
+
+        t = t0.repeat_interleave(restarts, 0)
+        f = ft[start:end].repeat_interleave(restarts, 0)
+        rm = rand_mse[start:end].repeat_interleave(restarts)
+        rc = rand_cos[start:end].repeat_interleave(restarts)
+        t_maps = tuple(u.repeat_interleave(restarts, 0) for u in target_maps)
+        t_attrs = target_attrs.repeat_interleave(restarts, 0)
+        rows = torch.arange(count, device=z.device)
+
+        for iteration in range(steps + 1):
+            x = G(z)
+            maps = classifier_spatial_maps(C, x)
+            raw_features = F.adaptive_avg_pool2d(maps[-1], 1).flatten(1)
+            fx = F.normalize(raw_features, dim=1)
+            total, pixel, feature, mse, cosine = scores(x, t, fx, f, rm, rc)
+            spatial = spatial_distance(maps, t_maps)
+            attr_loss = (torch.sigmoid(C.fc(raw_features)) - t_attrs).square().mean(1)
+
+            with torch.no_grad():
+                total_v = total.detach().reshape(count, restarts)
+                pixel_v = pixel.detach().reshape(count, restarts)
+                feature_v = feature.detach().reshape(count, restarts)
+                spatial_v = spatial.detach().reshape(count, restarts)
+
+                eligible = (
+                    (total_v > best_score[:, None] + 2e-5)
+                    & (pixel_v >= base_pixel[start:end, None] - 0.003)
+                    & (feature_v >= base_feature[start:end, None] - 0.003)
+                    & (spatial_v < best_spatial[:, None] - 0.0005)
+                )
+                # Prioritize score, with spatial agreement as a tie-breaker.
+                merit = total_v + 0.03 * (best_spatial[:, None] - spatial_v)
+                merit = merit.masked_fill(~eligible, -1.0)
+                candidate_merit, indexes = merit.max(dim=1)
+                accepted = candidate_merit >= 0
+                latents = z.detach().reshape(count, restarts, dim)[rows, indexes]
+                best_z[accepted] = latents[accepted]
+                best_score[accepted] = total_v[rows, indexes][accepted]
+                best_pixel[accepted] = pixel_v[rows, indexes][accepted]
+                best_feature[accepted] = feature_v[rows, indexes][accepted]
+                best_spatial[accepted] = spatial_v[rows, indexes][accepted]
+
+            if iteration == steps:
+                break
+            pix_loss = mse / rm
+            feat_loss = (1 - cosine) / (1 - rc).clamp_min(1e-6)
+            coarse = (F.avg_pool2d(x, 4) - F.avg_pool2d(t, 4)).square().mean((1, 2, 3)) / rm
+            loss = (
+                0.65 * pix_loss + 0.30 * feat_loss + 0.10 * coarse
+                + spatial_weight * spatial + attribute_weight * attr_loss
+            ).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            project_norm_(z)
+
+        result_z[start:end] = best_z
+        result_score[start:end] = best_score
+        result_pixel[start:end] = best_pixel
+        result_feature[start:end] = best_feature
+        changed = int((best_score > base_score[start:end] + 2e-5).sum().item())
+        accepted_count += changed
+        print(f"Spatial identity {end}/{n}: {changed}/{count} changed", flush=True)
+
+    print(f"Spatial improvements accepted: {accepted_count}/{n}", flush=True)
+    return result_z, result_score, result_pixel, result_feature
+
+
 @torch.no_grad()
 def save_comparisons(G, targets, z, values):
     faces = torch.cat([G(z[i:i + 20]) for i in range(0, len(z), 20)])
@@ -378,6 +507,12 @@ def main():
     p.add_argument("--semantic_restarts", type=int, default=3)
     p.add_argument("--semantic_lr", type=float, default=0.012)
     p.add_argument("--semantic_attr_weight", type=float, default=0.20)
+    p.add_argument("--spatial_steps", type=int, default=50)
+    p.add_argument("--spatial_fraction", type=float, default=0.65)
+    p.add_argument("--spatial_lr", type=float, default=0.010)
+    p.add_argument("--spatial_restarts", type=int, default=2)
+    p.add_argument("--spatial_weight", type=float, default=0.12)
+    p.add_argument("--spatial_attr_weight", type=float, default=0.15)
     p.add_argument("--max_feature_drop", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
     # Search five seeds in one run; only ONE z.pt will be saved.
@@ -402,6 +537,10 @@ def main():
             raise ValueError("seeds must be unique nonnegative integers")
     except ValueError:
         p.error("--seeds must contain unique nonnegative integers, e.g. 0,1,2")
+    if (not 0 <= a.spatial_fraction <= 1 or a.spatial_steps < 0
+            or a.spatial_lr <= 0 or a.spatial_restarts < 1
+            or a.spatial_weight < 0 or a.spatial_attr_weight < 0):
+        p.error("Invalid spatial refinement arguments")
     if (not 0 <= a.semantic_fraction <= 1 or a.semantic_steps < 0
             or a.semantic_restarts < 1 or a.semantic_lr <= 0
             or a.semantic_attr_weight < 0):
@@ -569,6 +708,31 @@ def main():
         print(f"After semantic stage: local={values.mean().item()*100:.2f}, "
               f"pixel={pix.mean().item():.4f}, "
               f"feature={feat.mean().item():.4f}", flush=True)
+
+    if a.spatial_steps > 0 and a.spatial_fraction > 0:
+        spatial_n = max(1, round(len(target) * a.spatial_fraction))
+        # Score is public, so this is only a heuristic for difficult images.
+        spatial_idx = values.argsort()[:spatial_n]
+        old_total = values.mean().item() * 100
+        old_pix = pix.mean().item()
+        old_feat = feat.mean().item()
+        zz, ss, pp, ff = refine_spatial_identity(
+            G, C, target[spatial_idx], ft[spatial_idx],
+            rand_mse[spatial_idx], rand_cos[spatial_idx],
+            z[spatial_idx], values[spatial_idx], pix[spatial_idx], feat[spatial_idx],
+            steps=a.spatial_steps, lr=a.spatial_lr,
+            batch_size=a.batch_size, restarts=a.spatial_restarts,
+            spatial_weight=a.spatial_weight,
+            attribute_weight=a.spatial_attr_weight
+        )
+        z[spatial_idx] = zz
+        values[spatial_idx] = ss
+        pix[spatial_idx] = pp
+        feat[spatial_idx] = ff
+        print(f"Spatial stage: local {old_total:.2f} -> "
+              f"{values.mean().item()*100:.2f}, "
+              f"pixel {old_pix:.4f} -> {pix.mean().item():.4f}, "
+              f"feature {old_feat:.4f} -> {feat.mean().item():.4f}", flush=True)
 
     result = z.detach().cpu().float()
     if result.shape != (len(target), 128) or not torch.isfinite(result).all():
