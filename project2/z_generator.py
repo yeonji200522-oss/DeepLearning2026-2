@@ -241,6 +241,103 @@ def refine_pixels(G, C, target, ft, rand_mse, rand_cos,
     return refined_z, chosen_score, chosen_pixel, chosen_feature
 
 
+def refine_semantics(G, C, target, ft, rand_mse, rand_cos,
+                     original_z, original_total, original_pixel, original_feature,
+                     steps, lr, batch_size, restarts=3, attr_weight=0.20,
+                     noise=0.12):
+    """Conservative 20-attribute refinement with strict score safeguards.
+
+    Attribute probabilities come from the supplied classifier's 20 outputs.
+    Accept candidate only if normalized pixel/feature scores and public
+    reference score remain within a narrow bound and attributes improve.
+    This does NOT guarantee improved hidden-classifier score.
+    """
+    n, dim = original_z.shape
+    result_z = original_z.clone()
+    result_total = original_total.clone()
+    result_pixel = original_pixel.clone()
+    result_feature = original_feature.clone()
+    gain_count = 0
+    for start in range(0, n, batch_size):
+        end = min(n, start + batch_size)
+        count = end - start
+        t0 = target[start:end]
+        with torch.no_grad():
+            t_attr = torch.sigmoid(C(t0))
+            initial_attr = torch.sigmoid(C(G(original_z[start:end])))
+            best_attr = (initial_attr - t_attr).square().mean(dim=1)
+        best_z = result_z[start:end].clone()
+        best_total = result_total[start:end].clone()
+        best_pixel = result_pixel[start:end].clone()
+        best_feature = result_feature[start:end].clone()
+
+        init = original_z[start:end, None].repeat(1, restarts, 1)
+        if restarts > 1 and noise > 0:
+            init[:, 1:] += torch.randn_like(init[:, 1:]) * noise
+        z = torch.nn.Parameter(init.reshape(count * restarts, dim).clone())
+        project_norm_(z)
+        optimizer = torch.optim.Adam([z], lr=lr)
+        t = t0.repeat_interleave(restarts, 0)
+        f = ft[start:end].repeat_interleave(restarts, 0)
+        rm = rand_mse[start:end].repeat_interleave(restarts)
+        rc = rand_cos[start:end].repeat_interleave(restarts)
+        attr_target = t_attr.repeat_interleave(restarts, 0)
+
+        for step in range(steps + 1):
+            x = G(z)
+            raw_features = C.features(x)
+            fx = F.normalize(raw_features, dim=1)
+            total, pixel, feature, mse, cosine = scores(
+                x, t, fx, f, rm, rc)
+            attr_loss = (
+                torch.sigmoid(C.fc(raw_features)) - attr_target
+            ).square().mean(dim=1)
+            with torch.no_grad():
+                totals = total.detach().reshape(count, restarts)
+                pixels = pixel.detach().reshape(count, restarts)
+                feats = feature.detach().reshape(count, restarts)
+                attrs = attr_loss.detach().reshape(count, restarts)
+                good = (
+                    (totals >= best_total[:, None] + 1e-5)
+                    & (pixels >= original_pixel[start:end, None] - 0.003)
+                    & (feats >= original_feature[start:end, None] - 0.010)
+                    & (attrs < best_attr[:, None] - 1e-4)
+                )
+                merit = (totals + 0.10 * (best_attr[:, None] - attrs))
+                merit = merit.masked_fill(~good, -1.0)
+                cand, idx = merit.max(dim=1)
+                accepted = cand >= 0
+                row = torch.arange(count, device=z.device)
+                candidate_z = z.detach().reshape(count, restarts, dim)[row, idx]
+                best_z[accepted] = candidate_z[accepted]
+                best_total[accepted] = totals[row, idx][accepted]
+                best_pixel[accepted] = pixels[row, idx][accepted]
+                best_feature[accepted] = feats[row, idx][accepted]
+                best_attr[accepted] = attrs[row, idx][accepted]
+
+            if step == steps:
+                break
+            pixel_loss = mse / rm
+            feature_loss = (1 - cosine) / (1 - rc).clamp_min(1e-6)
+            coarse = (F.avg_pool2d(x, 4) - F.avg_pool2d(t, 4)).square().mean((1, 2, 3)) / rm
+            loss = (0.65 * pixel_loss + 0.30 * feature_loss
+                    + 0.10 * coarse + attr_weight * attr_loss).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            project_norm_(z)
+
+        result_z[start:end] = best_z
+        result_total[start:end] = best_total
+        result_pixel[start:end] = best_pixel
+        result_feature[start:end] = best_feature
+        changed = (best_total > original_total[start:end] + 1e-5).sum().item()
+        gain_count += int(changed)
+        print(f"Attribute refinement {end}/{n}: {changed}/{count} improved", flush=True)
+    print(f"Accepted attribute refinements: {gain_count}/{n}", flush=True)
+    return result_z, result_total, result_pixel, result_feature
+
+
 @torch.no_grad()
 def save_comparisons(G, targets, z, values):
     faces = torch.cat([G(z[i:i + 20]) for i in range(0, len(z), 20)])
@@ -276,6 +373,11 @@ def main():
     p.add_argument("--hard_fraction", type=float, default=0.35)
     p.add_argument("--hard_steps", type=int, default=90)
     p.add_argument("--hard_noise", type=float, default=0.20)
+    p.add_argument("--semantic_steps", type=int, default=55)
+    p.add_argument("--semantic_fraction", type=float, default=0.35)
+    p.add_argument("--semantic_restarts", type=int, default=3)
+    p.add_argument("--semantic_lr", type=float, default=0.012)
+    p.add_argument("--semantic_attr_weight", type=float, default=0.20)
     p.add_argument("--max_feature_drop", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
     # Search five seeds in one run; only ONE z.pt will be saved.
@@ -300,6 +402,10 @@ def main():
             raise ValueError("seeds must be unique nonnegative integers")
     except ValueError:
         p.error("--seeds must contain unique nonnegative integers, e.g. 0,1,2")
+    if (not 0 <= a.semantic_fraction <= 1 or a.semantic_steps < 0
+            or a.semantic_restarts < 1 or a.semantic_lr <= 0
+            or a.semantic_attr_weight < 0):
+        p.error("Invalid semantic refinement arguments")
     if not (0 <= a.hard_fraction <= 1) or a.hard_steps < 0 or a.hard_noise < 0:
         p.error("Invalid hard-target optimization arguments")
     if (a.pixel_steps < 0 or a.pixel_lr <= 0 or a.pixel_restarts < 1 or
@@ -443,6 +549,26 @@ def main():
         feat[hard_idx] = hard_f
         print(f"Hard-target local score: {before_hard.mean().item()*100:.2f} -> "
               f"{hard_s.mean().item()*100:.2f}", flush=True)
+
+    if a.semantic_steps > 0 and a.semantic_fraction > 0:
+        # Focus additional attribute matching on weak local faces.
+        attr_n = max(1, round(len(target) * a.semantic_fraction))
+        sem_idx = values.argsort()[:attr_n]
+        z_new, s_new, p_new, f_new = refine_semantics(
+            G, C, target[sem_idx], ft[sem_idx],
+            rand_mse[sem_idx], rand_cos[sem_idx],
+            z[sem_idx], values[sem_idx], pix[sem_idx], feat[sem_idx],
+            steps=a.semantic_steps, lr=a.semantic_lr,
+            batch_size=a.batch_size, restarts=a.semantic_restarts,
+            attr_weight=a.semantic_attr_weight, noise=0.12
+        )
+        z[sem_idx] = z_new
+        values[sem_idx] = s_new
+        pix[sem_idx] = p_new
+        feat[sem_idx] = f_new
+        print(f"After semantic stage: local={values.mean().item()*100:.2f}, "
+              f"pixel={pix.mean().item():.4f}, "
+              f"feature={feat.mean().item():.4f}", flush=True)
 
     result = z.detach().cpu().float()
     if result.shape != (len(target), 128) or not torch.isfinite(result).all():
