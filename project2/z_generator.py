@@ -71,7 +71,9 @@ def random_start(G, C, target, ft, rand_mse, rand_cos, n_random, topk, chunk=32)
     n_pixel = topk - n_balanced
     balanced = vals.topk(n_balanced, dim=1).indices
     if n_pixel:
-        pixel_best = pixels_all.topk(n_pixel, dim=1).indices
+        available_pixel = pixels_all.clone()
+        available_pixel.scatter_(1, balanced, -1.0)
+        pixel_best = available_pixel.topk(n_pixel, dim=1).indices
         idx = torch.cat([balanced, pixel_best], dim=1)
     else:
         idx = balanced
@@ -90,6 +92,10 @@ def optimize(G, C, target, ft, rand_mse, rand_cos, init, steps, lr, batch, weigh
         count = stop - start
         z = torch.nn.Parameter(init[start:stop].reshape(count * k, dim).clone())
         optimizer = torch.optim.Adam([z], lr=lr)
+        # Different starts explore different pixel/identity trade-offs.
+        weights = torch.linspace(max(0.05, weight * 0.6),
+                                 min(0.50, weight * 2.5),
+                                 steps=k, device=target.device).repeat(count)
         t = target[start:stop].repeat_interleave(k, dim=0)
         f = ft[start:stop].repeat_interleave(k, dim=0)
         rm = rand_mse[start:stop].repeat_interleave(k)
@@ -115,8 +121,8 @@ def optimize(G, C, target, ft, rand_mse, rand_cos, init, steps, lr, batch, weigh
                 break
             # Differentiable, unclipped normalized surrogate of the scoring rule.
             coarse = (F.avg_pool2d(x, 4) - F.avg_pool2d(t, 4)).square().mean((1, 2, 3)) / rm
-            loss = ((1 - weight) * (mse / rm + coarse_weight * coarse) +
-                    weight * (1 - cosine) / (1 - rc).clamp_min(1e-6)).mean()
+            loss = ((1 - weights) * (mse / rm + coarse_weight * coarse) +
+                    weights * (1 - cosine) / (1 - rc).clamp_min(1e-6)).mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -153,8 +159,8 @@ def refine_pixels(G, C, target, ft, rand_mse, rand_cos,
                   base_z, base_scores, base_pixel, base_feature,
                   steps, lr, feature_weight, batch_size,
                   restarts=2, noise=0.03, max_feature_drop=0.02,
-                  coarse_weight=0.2):
-    """Refine z for pixels, preserving public score and limiting feature loss.
+                  coarse_weight=0.2, improve="pixel"):
+    """Refine latent vectors under guardrails for pixel or total improvements.
 
     The original candidate is kept unless a candidate improves pixel score,
     preserves the starting combined public score and keeps feature score
@@ -189,19 +195,29 @@ def refine_pixels(G, C, target, ft, rand_mse, rand_cos,
                 totals = total.detach().reshape(b, restarts)
                 pixels = pixel.detach().reshape(b, restarts)
                 features = feature.detach().reshape(b, restarts)
-                eligible = (
-                    (pixels > chosen_pixel[start:stop, None] + 1e-6)
-                    & (features >= feature_floor)
-                    & (totals + 1e-7 >= baseline_total)
-                )
-                candidates = pixels.masked_fill(~eligible, -1.0)
+                if improve == "pixel":
+                    eligible = (
+                        (pixels > chosen_pixel[start:stop, None] + 1e-6)
+                        & (features >= feature_floor)
+                        & (totals + 1e-7 >= baseline_total)
+                    )
+                    criterion = pixels
+                else:
+                    # Hard targets: allow only a negligible pixel sacrifice.
+                    eligible = (
+                        (totals > chosen_score[start:stop, None] + 1e-6)
+                        & (pixels >= base_pixel[start:stop, None] - 0.003)
+                        & (features >= feature_floor)
+                    )
+                    criterion = totals
+                candidates = criterion.masked_fill(~eligible, -1.0)
                 val, index = candidates.max(dim=1)
                 keep = val >= 0
                 row = torch.arange(b, device=z.device)
                 chosen_z = z.detach().reshape(b, restarts, dim)[row, index]
                 refined_z[start:stop][keep] = chosen_z[keep]
                 chosen_score[start:stop][keep] = totals[row, index][keep]
-                chosen_pixel[start:stop][keep] = val[keep]
+                chosen_pixel[start:stop][keep] = pixels[row, index][keep]
                 chosen_feature[start:stop][keep] = features[row, index][keep]
 
             if iteration == steps:
@@ -244,18 +260,21 @@ def main():
     p.add_argument("--out", default="z.pt")
     p.add_argument("--resume_z", default=None,
                    help="Existing z.pt; skip initial search and stage-1 optimization")
-    p.add_argument("--n_random", type=int, default=2500)
+    p.add_argument("--n_random", type=int, default=3000)
     p.add_argument("--topk", type=int, default=4)
     p.add_argument("--steps", type=int, default=120)
     p.add_argument("--lr", type=float, default=0.035)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--feature_weight", type=float, default=0.15)
+    p.add_argument("--feature_weight", type=float, default=0.20)
     p.add_argument("--coarse_weight", type=float, default=0.20)
-    p.add_argument("--pixel_steps", type=int, default=100)
+    p.add_argument("--pixel_steps", type=int, default=80)
     p.add_argument("--pixel_lr", type=float, default=0.012)
-    p.add_argument("--pixel_feature_weight", type=float, default=0.12)
+    p.add_argument("--pixel_feature_weight", type=float, default=0.18)
     p.add_argument("--pixel_restarts", type=int, default=3)
     p.add_argument("--pixel_noise", type=float, default=0.06)
+    p.add_argument("--hard_fraction", type=float, default=0.25)
+    p.add_argument("--hard_steps", type=int, default=60)
+    p.add_argument("--hard_noise", type=float, default=0.16)
     p.add_argument("--max_feature_drop", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -266,6 +285,8 @@ def main():
         p.error("Require 0 <= feature_weight <= 1 and lr > 0")
     if a.coarse_weight < 0:
         p.error("coarse_weight must be nonnegative")
+    if not (0 <= a.hard_fraction <= 1) or a.hard_steps < 0 or a.hard_noise < 0:
+        p.error("Invalid hard-target optimization arguments")
     if (a.pixel_steps < 0 or a.pixel_lr <= 0 or a.pixel_restarts < 1 or
             a.pixel_noise < 0 or a.max_feature_drop < 0 or
             not (0 <= a.pixel_feature_weight <= 1)):
@@ -326,6 +347,26 @@ def main():
         print(f"Feature: {old_feat.mean().item():.4f} -> {feat.mean().item():.4f}")
         print(f"Local score: {old_total.mean().item()*100:.2f} -> {values.mean().item()*100:.2f}")
         print(f"Improved pixel for {(pix > old_pix + 1e-6).sum().item()}/{len(pix)} images")
+    if a.hard_steps > 0 and a.hard_fraction > 0:
+        hard_n = max(1, round(len(target) * a.hard_fraction))
+        hard_idx = values.argsort()[:hard_n]
+        before_hard = values[hard_idx].clone()
+        hard_z, hard_s, hard_p, hard_f = refine_pixels(
+            G, C, target[hard_idx], ft[hard_idx],
+            rand_mse[hard_idx], rand_cos[hard_idx],
+            z[hard_idx], values[hard_idx], pix[hard_idx], feat[hard_idx],
+            steps=a.hard_steps, lr=0.012, feature_weight=0.26,
+            batch_size=a.batch_size, restarts=3, noise=a.hard_noise,
+            max_feature_drop=0.015, coarse_weight=a.coarse_weight,
+            improve="score"
+        )
+        z[hard_idx] = hard_z
+        values[hard_idx] = hard_s
+        pix[hard_idx] = hard_p
+        feat[hard_idx] = hard_f
+        print(f"Hard-target local score: {before_hard.mean().item()*100:.2f} -> "
+              f"{hard_s.mean().item()*100:.2f}", flush=True)
+
     result = z.detach().cpu().float()
     if result.shape != (len(target), 128) or not torch.isfinite(result).all():
         raise ValueError("Invalid submission tensor")
